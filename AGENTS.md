@@ -23,7 +23,7 @@ Core data services:
 - **calendar** - CRUD, color control, remote-link metadata
 - **alarm** - Check due alarms. Fire, dismiss, and snooze alarms
 - **recurrence** - Expand recurring events, todos, and journals. Apply overrides
-- **trash** - Mixed soft-delete view of events, todos, and journals (list, restore, purge)
+- **trash** - Mixed soft-delete view of events, todos, and journals (list, single restore/purge, atomic batch restore/purge)
 
 Integration packages and infrastructure packages do not use the `NewService` shape above. Each package has its own constructor:
 
@@ -222,14 +222,25 @@ The EXDATE-provenance rule lives in `softdelete.ClearMasterEXDATE`. Strip only E
 The `internal/trash` package joins all three domains:
 
 ```go
-trashSvc := trash.NewService(a.Events, a.Todos, a.Journals)
+trashSvc := trash.NewService(a.DB, a.Events, a.Todos, a.Journals)
 entries, err := trashSvc.List(ctx, calendarID) // newest-first, all kinds
-err = trashSvc.Restore(ctx, entries[0])
-err = trashSvc.Purge(ctx, entries[0])
+err = trashSvc.Restore(ctx, entries[0])        // one-entry batch
+err = trashSvc.Purge(ctx, entries[0])          // one-entry batch
+err = trashSvc.RestoreBatch(ctx, entries)      // all-or-nothing, one tx
+err = trashSvc.PurgeBatch(ctx, entries)        // all-or-nothing, one tx
 counts, err := trashSvc.PurgeOld(ctx, time.Now().Add(-30*24*time.Hour))
 ```
 
 `Entry.Kind` (KindEvent, KindEventInstance, KindEventSeriesTail, KindTodo, KindJournal) tells the caller which fields have values.
+
+A batch runs two phases in one transaction:
+
+- The check phase tests every entry. It checks existence, deleted state, and calendar write permission.
+- The apply phase writes the domain rows, EXDATE and RRULE changes, provenance log rows, and sync tombstone and dirty marks.
+- One failure rolls the whole batch back.
+- Repeated kind+ID pairs act once.
+- Overlapping forms of one series are idempotent in one batch. Examples are a truncation log with the hidden override row, or an instance log with its override row.
+- After a batch call, re-read the trash list and the event state. Do not keep stale rows or stale marks on screen.
 
 ## AI-assisted contributions
 

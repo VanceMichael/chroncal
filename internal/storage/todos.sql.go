@@ -975,6 +975,25 @@ func (q *Queries) RestoreTodo(ctx context.Context, id int64) error {
 	return err
 }
 
+const restoreTodoRow = `-- name: RestoreTodoRow :execrows
+UPDATE todos SET
+    deleted_at = NULL,
+    sequence = sequence + 1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = ? AND deleted_at IS NOT NULL
+`
+
+// Same update as RestoreTodo, but it reports the number of rows changed. A
+// batch apply then fails when another operation restored or purged the row
+// between the batch check and the batch apply.
+func (q *Queries) RestoreTodoRow(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, restoreTodoRow, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const restoreTodosByUID = `-- name: RestoreTodosByUID :execrows
 UPDATE todos SET
     deleted_at = NULL,

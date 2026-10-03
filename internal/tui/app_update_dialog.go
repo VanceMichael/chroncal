@@ -137,12 +137,11 @@ func (m Model) handleConfirmDialogResult(msg ConfirmDialogResultMsg) (tea.Model,
 		entries := act.target.entries
 		title := act.label
 		return m, func() tea.Msg {
-			for _, e := range entries {
-				if err := m.app.Trash.Purge(context.Background(), e); err != nil {
-					return trashActionDoneMsg{action: "purged", title: title, err: err}
-				}
-			}
-			return trashActionDoneMsg{action: "purged", title: title, err: nil}
+			// One atomic batch: a failure for one entry rolls every hard
+			// delete back, so a purge can never remove only part of the
+			// selection.
+			err := m.app.Trash.PurgeBatch(context.Background(), entries)
+			return trashActionDoneMsg{action: "purged", title: title, err: err}
 		}
 	case pendingActionCalendarKeepLocal:
 		id := act.target.calendarID

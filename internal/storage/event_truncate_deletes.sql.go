@@ -18,6 +18,21 @@ func (q *Queries) DeleteEventTruncateDelete(ctx context.Context, id int64) error
 	return err
 }
 
+const deleteEventTruncateDeleteChecked = `-- name: DeleteEventTruncateDeleteChecked :execrows
+DELETE FROM event_truncate_deletes WHERE id = ?
+`
+
+// Same delete as DeleteEventTruncateDelete, but it reports the number of rows
+// removed. A batch apply then fails when another operation consumed the log
+// row between the batch check and the batch apply.
+func (q *Queries) DeleteEventTruncateDeleteChecked(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteEventTruncateDeleteChecked, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const getEventTruncateDelete = `-- name: GetEventTruncateDelete :one
 SELECT id, calendar_id, uid, cutoff_time, previous_rrule, deleted_at, hidden_overrides, removed_rdates FROM event_truncate_deletes WHERE id = ?
 `

@@ -19,5 +19,11 @@ SELECT * FROM event_exdate_deletes WHERE uid = ? AND recurrence_id = ?;
 -- name: DeleteEventExdateDelete :exec
 DELETE FROM event_exdate_deletes WHERE id = ?;
 
+-- name: DeleteEventExdateDeleteChecked :execrows
+-- Same delete as DeleteEventExdateDelete, but it reports the number of rows
+-- removed. A batch apply then fails when another operation consumed the log
+-- row between the batch check and the batch apply.
+DELETE FROM event_exdate_deletes WHERE id = ?;
+
 -- name: PurgeOldEventExdateDeletes :execrows
 DELETE FROM event_exdate_deletes WHERE deleted_at < ?;

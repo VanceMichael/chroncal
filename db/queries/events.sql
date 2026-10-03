@@ -137,6 +137,16 @@ UPDATE events SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE id = ? AND deleted_at IS NOT NULL;
 
+-- name: RestoreEventRow :execrows
+-- Same update as RestoreEvent, but it reports the number of rows changed. A
+-- batch apply then fails when another operation restored or purged the row
+-- between the batch check and the batch apply.
+UPDATE events SET
+    deleted_at = NULL,
+    sequence = sequence + 1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = ? AND deleted_at IS NOT NULL;
+
 -- name: RestoreEventsByUID :execrows
 UPDATE events SET
     deleted_at = NULL,

@@ -138,6 +138,16 @@ UPDATE todos SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE id = ? AND deleted_at IS NOT NULL;
 
+-- name: RestoreTodoRow :execrows
+-- Same update as RestoreTodo, but it reports the number of rows changed. A
+-- batch apply then fails when another operation restored or purged the row
+-- between the batch check and the batch apply.
+UPDATE todos SET
+    deleted_at = NULL,
+    sequence = sequence + 1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = ? AND deleted_at IS NOT NULL;
+
 -- name: RestoreTodosByUID :execrows
 UPDATE todos SET
     deleted_at = NULL,

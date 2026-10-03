@@ -18,6 +18,21 @@ func (q *Queries) DeleteEventExdateDelete(ctx context.Context, id int64) error {
 	return err
 }
 
+const deleteEventExdateDeleteChecked = `-- name: DeleteEventExdateDeleteChecked :execrows
+DELETE FROM event_exdate_deletes WHERE id = ?
+`
+
+// Same delete as DeleteEventExdateDelete, but it reports the number of rows
+// removed. A batch apply then fails when another operation consumed the log
+// row between the batch check and the batch apply.
+func (q *Queries) DeleteEventExdateDeleteChecked(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteEventExdateDeleteChecked, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const getEventExdateDelete = `-- name: GetEventExdateDelete :one
 SELECT id, calendar_id, uid, recurrence_id, deleted_at FROM event_exdate_deletes WHERE id = ?
 `

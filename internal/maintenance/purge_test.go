@@ -50,7 +50,7 @@ func TestPurger_RunOnce_PurgesOnlyAckedOldAlarmStates(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	trashSvc := trash.NewService(events, todos, journals)
+	trashSvc := trash.NewService(db, events, todos, journals)
 
 	e, err := events.Create(ctx, event.CreateParams{
 		CalendarID: 1,
@@ -121,7 +121,7 @@ func TestPurger_RunOnce_NilQueriesSkipsAlarmStateCleanup(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	trashSvc := trash.NewService(events, todos, journals)
+	trashSvc := trash.NewService(db, events, todos, journals)
 
 	p := NewPurger(trashSvc, nil, 30, nil)
 	if _, err := p.RunOnce(context.Background()); err != nil {

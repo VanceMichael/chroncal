@@ -25,5 +25,11 @@ SELECT * FROM event_truncate_deletes WHERE uid = ? AND cutoff_time = ?;
 -- name: DeleteEventTruncateDelete :exec
 DELETE FROM event_truncate_deletes WHERE id = ?;
 
+-- name: DeleteEventTruncateDeleteChecked :execrows
+-- Same delete as DeleteEventTruncateDelete, but it reports the number of rows
+-- removed. A batch apply then fails when another operation consumed the log
+-- row between the batch check and the batch apply.
+DELETE FROM event_truncate_deletes WHERE id = ?;
+
 -- name: PurgeOldEventTruncateDeletes :execrows
 DELETE FROM event_truncate_deletes WHERE deleted_at < ?;

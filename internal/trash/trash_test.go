@@ -21,7 +21,7 @@ func TestService_ListMergesAllThreeDomains(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	svc := NewService(events, todos, journals)
+	svc := NewService(db, events, todos, journals)
 
 	ctx := context.Background()
 
@@ -106,7 +106,7 @@ func TestService_RestoreDispatchesByKind(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	svc := NewService(events, todos, journals)
+	svc := NewService(db, events, todos, journals)
 	ctx := context.Background()
 
 	td, err := todos.Create(ctx, todo.CreateParams{CalendarID: 1, Summary: "Restore Me"})
@@ -148,7 +148,7 @@ func TestService_PurgeDispatchesByKind(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	svc := NewService(events, todos, journals)
+	svc := NewService(db, events, todos, journals)
 	ctx := context.Background()
 
 	ev, _ := events.Create(ctx, event.CreateParams{
@@ -271,7 +271,7 @@ func TestService_ListPopulatesCategories(t *testing.T) {
 	events := event.NewService(db, q)
 	todos := todo.NewService(db, q)
 	journals := journal.NewService(db, q)
-	svc := NewService(events, todos, journals)
+	svc := NewService(db, events, todos, journals)
 	ctx := context.Background()
 
 	ev, err := events.Create(ctx, event.CreateParams{

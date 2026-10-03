@@ -87,7 +87,7 @@ func New(dbPath string) (*App, error) {
 		Journals:                     journalSvc,
 		Alarms:                       alarm.NewService(db, queries, eventSvc, todoSvc),
 		Recurrences:                  recurrence.NewService(db, queries),
-		Trash:                        trash.NewService(eventSvc, todoSvc, journalSvc),
+		Trash:                        trash.NewService(db, eventSvc, todoSvc, journalSvc),
 		CredentialNamespace:          credentialScopes.Current,
 		PreviousCredentialNamespaces: previousCredentialNamespaces,
 		MigrateLegacyCredentials:     migrateLegacyCredentials,

@@ -123,6 +123,16 @@ UPDATE journals SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE id = ? AND deleted_at IS NOT NULL;
 
+-- name: RestoreJournalRow :execrows
+-- Same update as RestoreJournal, but it reports the number of rows changed.
+-- A batch apply then fails when another operation restored or purged the row
+-- between the batch check and the batch apply.
+UPDATE journals SET
+    deleted_at = NULL,
+    sequence = sequence + 1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = ? AND deleted_at IS NOT NULL;
+
 -- name: RestoreJournalsByUID :execrows
 UPDATE journals SET
     deleted_at = NULL,

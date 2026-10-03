@@ -564,12 +564,10 @@ func (m Model) handleTrashRestoreRequested(msg TrashRestoreRequestedMsg) (tea.Mo
 	}
 	title := trashBulkTitle(entries)
 	return m, func() tea.Msg {
-		for _, e := range entries {
-			if err := m.app.Trash.Restore(context.Background(), e); err != nil {
-				return trashActionDoneMsg{action: "restored", title: title, err: err}
-			}
-		}
-		return trashActionDoneMsg{action: "restored", title: title, err: nil}
+		// One atomic batch: a failure for one entry rolls every restore
+		// back, so the selection can never land half-restored.
+		err := m.app.Trash.RestoreBatch(context.Background(), entries)
+		return trashActionDoneMsg{action: "restored", title: title, err: err}
 	}
 }
 
@@ -595,12 +593,17 @@ func (m Model) handleTrashPurgeRequested(msg TrashPurgeRequestedMsg) (tea.Model,
 	return m, nil
 }
 func (m Model) handleTrashActionDone(msg trashActionDoneMsg) (tea.Model, tea.Cmd) {
+	// Re-read real state after both outcomes. A rolled-back batch leaves
+	// the rows in trash, so a stale row must not stay on screen and a
+	// retry must not act on a stale selection. On success the committed
+	// rows are gone and marks clear; on failure every mark stays so the
+	// user can retry the same selection after seeing the error.
+	cmds := []tea.Cmd{m.loadTrash(), m.loadEvents()}
 	if msg.err != nil {
-		cmd := m.toast.Failed(msg.err.Error())
-		return m, cmd
+		cmds = append(cmds, m.toast.Failed(msg.err.Error()))
+		return m, tea.Batch(cmds...)
 	}
 	m.trash = m.trash.ClearMarks()
-	cmds := []tea.Cmd{m.loadTrash(), m.loadEvents()}
 	switch msg.action {
 	case "restored":
 		cmds = append(cmds, m.toast.Restored(msg.title))

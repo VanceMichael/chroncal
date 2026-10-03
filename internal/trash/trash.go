@@ -1,14 +1,23 @@
 // Package trash joins soft-deleted rows from the event, todo, and journal
-// services into one "Recently deleted" view. The TUI and CLI call
-// Service.List to show a mixed list newest-first. They then call
-// Service.Restore or Service.Purge on one entry of any kind.
+// services into one "Recently deleted" view. The TUI calls Service.List
+// to show a mixed list newest-first. It then calls RestoreBatch or
+// PurgeBatch with the marked entries. Service.Restore and Service.Purge
+// are the one-entry forms of the same batch path.
+//
+// A batch runs in one transaction. Every entry passes its existence,
+// permission, and kind check before any entry changes a row. The domain
+// rows, EXDATE and RRULE changes, provenance log rows, and sync
+// tombstone and dirty side effects then commit together. One failed
+// entry rolls the whole batch back.
 //
 // Each service still owns its own soft-delete, restore, and purge paths.
-// This package is an aggregator. It does not hold new storage state.
+// This package is an aggregator. It holds no storage state of its own
+// apart from the shared database handle.
 package trash
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"time"
@@ -72,15 +81,18 @@ type Entry struct {
 // Service joins soft-delete state across event, todo, and journal
 // into one List/Restore/Purge surface.
 type Service struct {
+	db       *sql.DB
 	events   *event.Service
 	todos    *todo.Service
 	journals *journal.Service
 }
 
-// NewService wires the aggregator. Any of the arguments may be nil to
-// opt a domain out of trash aggregation (tests, partial features).
-func NewService(e *event.Service, t *todo.Service, j *journal.Service) *Service {
-	return &Service{events: e, todos: t, journals: j}
+// NewService wires the aggregator. db is the shared database handle the
+// batch paths use for one cross-domain transaction. Any of the service
+// arguments may be nil to opt a domain out of trash aggregation (tests,
+// partial features).
+func NewService(db *sql.DB, e *event.Service, t *todo.Service, j *journal.Service) *Service {
+	return &Service{db: db, events: e, todos: t, journals: j}
 }
 
 // PurgeCounts reports how many rows each domain dropped from a PurgeOld
@@ -136,50 +148,202 @@ func (s *Service) List(ctx context.Context, calendarID int64) ([]Entry, error) {
 	return entries, nil
 }
 
-// Restore reverses the delete recorded in e. It dispatches by Kind.
-func (s *Service) Restore(ctx context.Context, e Entry) error {
-	switch e.Kind {
-	case KindEvent, KindEventInstance, KindEventSeriesTail:
-		if s.events == nil {
-			return fmt.Errorf("events service not configured")
-		}
-		return s.events.RestoreTrash(ctx, toEventTrash(e))
-	case KindTodo:
-		if s.todos == nil {
-			return fmt.Errorf("todos service not configured")
-		}
-		return s.todos.RestoreByID(ctx, e.ID)
-	case KindJournal:
-		if s.journals == nil {
-			return fmt.Errorf("journals service not configured")
-		}
-		return s.journals.RestoreByID(ctx, e.ID)
+// batchOp selects the restore or purge path inside one batch
+// transaction.
+type batchOp int
+
+const (
+	batchRestore batchOp = iota
+	batchPurge
+)
+
+func (op batchOp) name() string {
+	switch op {
+	case batchRestore:
+		return "restore"
+	case batchPurge:
+		return "purge"
 	default:
-		return fmt.Errorf("unknown trash kind %d", e.Kind)
+		return "batch"
 	}
 }
 
-// Purge hard-removes e from the trash.
+// BatchError reports which entry of a batch failed and why. Index is the
+// 1-based position in the deduplicated batch. The wrapped error stays
+// available via errors.Is / errors.As so callers can still detect
+// domain errors such as event.ErrNotDeleted or calendaraccess.ErrReadOnly.
+type BatchError struct {
+	Op    string
+	Index int
+	Entry Entry
+	Err   error
+}
+
+func (e *BatchError) Error() string {
+	title := e.Entry.Title
+	if title == "" {
+		title = e.Entry.Kind.Label()
+	}
+	return fmt.Sprintf("%s item %d of batch (%q): %v", e.Op, e.Index, title, e.Err)
+}
+
+func (e *BatchError) Unwrap() error { return e.Err }
+
+// Restore reverses the delete recorded in e. It runs through the same
+// atomic batch path a multi-entry restore uses, so single and batch
+// semantics stay identical.
+func (s *Service) Restore(ctx context.Context, e Entry) error {
+	return s.RestoreBatch(ctx, []Entry{e})
+}
+
+// Purge hard-removes e from the trash. It runs through the same atomic
+// batch path a multi-entry purge uses, so single and batch semantics stay
+// identical.
 func (s *Service) Purge(ctx context.Context, e Entry) error {
-	switch e.Kind {
-	case KindEvent, KindEventInstance, KindEventSeriesTail:
+	return s.PurgeBatch(ctx, []Entry{e})
+}
+
+// RestoreBatch restores every entry in one atomic transaction. The
+// method first runs the existence, permission, and kind checks for every
+// entry. It then applies the domain writes. The domain rows, EXDATE and
+// RRULE changes, the delete-source log rows, and the sync tombstone and
+// dirty side effects all commit together. Any failure rolls the whole
+// batch back. Callers never observe a partially restored selection.
+func (s *Service) RestoreBatch(ctx context.Context, entries []Entry) error {
+	return s.runBatch(ctx, entries, batchRestore)
+}
+
+// PurgeBatch permanently removes every entry in one atomic transaction.
+// The check phase runs first for every entry. The hard deletes then
+// commit together. Any failure rolls the whole batch back, so a purge
+// can never leave a subset of the selection permanently removed.
+func (s *Service) PurgeBatch(ctx context.Context, entries []Entry) error {
+	return s.runBatch(ctx, entries, batchPurge)
+}
+
+// runBatch is the shared two-phase batch driver. It deduplicates entries
+// by kind and ID in first-seen order so a repeated mark cannot act twice
+// on one row. Static problems (unknown kind, domain not configured) fail
+// before a transaction opens.
+func (s *Service) runBatch(ctx context.Context, entries []Entry, op batchOp) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if s.db == nil {
+		return fmt.Errorf("trash: database not configured")
+	}
+
+	unique := make([]Entry, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for i, e := range entries {
+		if err := s.validateEntry(e); err != nil {
+			return &BatchError{Op: op.name(), Index: i + 1, Entry: e, Err: err}
+		}
+		key := fmt.Sprintf("%d:%d", e.Kind, e.ID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, e)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin batch tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Phase 1: verify every entry against current state. This phase
+	// performs no writes.
+	for i, e := range unique {
+		if err := s.checkEntry(ctx, tx, e, op); err != nil {
+			return &BatchError{Op: op.name(), Index: i + 1, Entry: e, Err: err}
+		}
+	}
+
+	// Phase 2: apply every mutation on the same transaction.
+	for i, e := range unique {
+		if err := s.applyEntry(ctx, tx, e, op); err != nil {
+			return &BatchError{Op: op.name(), Index: i + 1, Entry: e, Err: err}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch: %w", err)
+	}
+	return nil
+}
+
+// validateEntry verifies the Kind is known and the domain service that
+// owns it is configured. It runs before the batch transaction opens.
+func (s *Service) validateEntry(e Entry) error {
+	switch {
+	case e.Kind.IsEvent():
 		if s.events == nil {
 			return fmt.Errorf("events service not configured")
 		}
-		return s.events.PurgeTrashEntry(ctx, toEventTrash(e))
-	case KindTodo:
+	case e.Kind.IsTodo():
 		if s.todos == nil {
 			return fmt.Errorf("todos service not configured")
 		}
-		return s.todos.PurgeByID(ctx, e.ID)
-	case KindJournal:
+	case e.Kind.IsJournal():
 		if s.journals == nil {
 			return fmt.Errorf("journals service not configured")
 		}
-		return s.journals.PurgeByID(ctx, e.ID)
 	default:
 		return fmt.Errorf("unknown trash kind %d", e.Kind)
 	}
+	return nil
+}
+
+// checkEntry dispatches the read-only feasibility check for one entry.
+func (s *Service) checkEntry(ctx context.Context, tx *sql.Tx, e Entry, op batchOp) error {
+	switch op {
+	case batchRestore:
+		switch {
+		case e.Kind.IsEvent():
+			return s.events.CheckRestoreTrashEntry(ctx, tx, toEventTrash(e))
+		case e.Kind.IsTodo():
+			return s.todos.CheckRestoreTrashID(ctx, tx, e.ID)
+		case e.Kind.IsJournal():
+			return s.journals.CheckRestoreTrashID(ctx, tx, e.ID)
+		}
+	case batchPurge:
+		switch {
+		case e.Kind.IsEvent():
+			return s.events.CheckPurgeTrashEntry(ctx, tx, toEventTrash(e))
+		case e.Kind.IsTodo():
+			return s.todos.CheckPurgeTrashID(ctx, tx, e.ID)
+		case e.Kind.IsJournal():
+			return s.journals.CheckPurgeTrashID(ctx, tx, e.ID)
+		}
+	}
+	return fmt.Errorf("unknown trash kind %d", e.Kind)
+}
+
+// applyEntry dispatches the write for one entry on the batch transaction.
+func (s *Service) applyEntry(ctx context.Context, tx *sql.Tx, e Entry, op batchOp) error {
+	switch op {
+	case batchRestore:
+		switch {
+		case e.Kind.IsEvent():
+			return s.events.ApplyRestoreTrashEntry(ctx, tx, toEventTrash(e))
+		case e.Kind.IsTodo():
+			return s.todos.ApplyRestoreTrashID(ctx, tx, e.ID)
+		case e.Kind.IsJournal():
+			return s.journals.ApplyRestoreTrashID(ctx, tx, e.ID)
+		}
+	case batchPurge:
+		switch {
+		case e.Kind.IsEvent():
+			return s.events.ApplyPurgeTrashEntry(ctx, tx, toEventTrash(e))
+		case e.Kind.IsTodo():
+			return s.todos.ApplyPurgeTrashID(ctx, tx, e.ID)
+		case e.Kind.IsJournal():
+			return s.journals.ApplyPurgeTrashID(ctx, tx, e.ID)
+		}
+	}
+	return fmt.Errorf("unknown trash kind %d", e.Kind)
 }
 
 // PurgeOld walks each domain's retention purge and returns per-domain
