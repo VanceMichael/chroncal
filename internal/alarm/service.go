@@ -58,7 +58,15 @@ type DueAlarm struct {
 	Event     event.Event
 	Alarm     model.Alarm
 	TriggerAt time.Time
-	StateID   int64 // non-zero for re-fired snoozed alarms
+	StateID   int64 // non-zero for re-fired snoozed or recovered dispatches
+	// Attempts is the dispatch attempt number this claim runs. It is 1 for
+	// a fresh fire or a snooze refire. A recovery carries stored attempts
+	// plus one. It selects the retry backoff on failure.
+	Attempts int
+	// Claim selects the atomic claim statement. ClaimFresh inserts a new
+	// row. ClaimRefire clears an expired snooze. ClaimRecover takes over a
+	// retry-due row or an orphaned dispatch.
+	Claim ClaimKind
 }
 
 type Service struct {
@@ -66,10 +74,21 @@ type Service struct {
 	q      *storage.Queries
 	events *event.Service
 	todos  TodoAlarmLister
+	// claimToken identifies this service instance in dispatch ownership
+	// UPDATEs. One token per process keeps overlapping checkers distinct.
+	claimToken string
 }
 
 func NewService(db *sql.DB, q *storage.Queries, events *event.Service, todos TodoAlarmLister) *Service {
-	return &Service{db: db, q: q, events: events, todos: todos}
+	return &Service{db: db, q: q, events: events, todos: todos, claimToken: newClaimToken()}
+}
+
+// todoSvc returns a TodoService that shares this instance claim token. The
+// event and todo sides of one checker must appear as one owner.
+func (s *Service) todoSvc() *TodoService {
+	ts := NewTodoService(s.db, s.q, s.todos)
+	ts.claimToken = s.claimToken
+	return ts
 }
 
 // Check finds all alarms that are due at the given time.
@@ -88,24 +107,32 @@ func (s *Service) Check(ctx context.Context, now time.Time) ([]DueAlarm, []TodoD
 	return eventAlarms, todoAlarms, nil
 }
 
-// MissedAlarm represents an alarm that was never fired because it became stale.
+// MissedAlarm represents an alarm that never reached the user because it
+// became stale. Delivery says how far it got: DispatchUnclaimed means no
+// checker ever claimed it; DispatchRetry or DispatchDispatching mean a
+// checker claimed it but every dispatch failed or the process never
+// finished the dispatch.
 type MissedAlarm struct {
 	EventTitle string
 	AlarmID    int64
 	TriggerAt  time.Time
 	Age        time.Duration
+	Delivery   string
 }
 
-// MissedTodoAlarm represents a todo alarm that was never fired because it became stale.
+// MissedTodoAlarm is the todo-alarm counterpart of MissedAlarm.
 type MissedTodoAlarm struct {
 	TodoSummary string
 	AlarmID     int64
 	TriggerAt   time.Time
 	Age         time.Duration
+	Delivery    string
 }
 
-// CheckMissed returns alarms from the last `lookback` that were never fired
-// (no alarm_state / todo_alarm_state entry) and are past the stale threshold.
+// CheckMissed returns alarms from the last `lookback` that never reached
+// the user and are past the stale threshold. That covers triggers with no
+// state row and claimed triggers that stayed in retry or dispatching state.
+// Delivered, acknowledged, and snoozed triggers are not reported.
 func (s *Service) CheckMissed(ctx context.Context, now time.Time, lookback time.Duration) ([]MissedAlarm, []MissedTodoAlarm, error) {
 	windowStart := now.Add(-lookback)
 
@@ -150,12 +177,13 @@ func (s *Service) CheckMissed(ctx context.Context, now time.Time, lookback time.
 			if err != nil {
 				continue
 			}
-			s.collectMissedTriggers(ctx, triggerAt, a, now, s.eventAlarmStateExists, func(t time.Time) {
+			s.collectMissedTriggers(ctx, triggerAt, a, now, s.eventAlarmDeliveryState, func(t time.Time, delivery string) {
 				missed = append(missed, MissedAlarm{
 					EventTitle: expEvt.Title,
 					AlarmID:    a.ID,
 					TriggerAt:  t,
 					Age:        now.Sub(t),
+					Delivery:   delivery,
 				})
 			})
 		}
@@ -217,12 +245,13 @@ func (s *Service) CheckMissed(ctx context.Context, now time.Time, lookback time.
 					if err != nil {
 						continue
 					}
-					s.collectMissedTriggers(ctx, triggerAt, a, now, s.todoAlarmStateExists, func(t time.Time) {
+					s.collectMissedTriggers(ctx, triggerAt, a, now, s.todoAlarmDeliveryState, func(t time.Time, delivery string) {
 						missedTodos = append(missedTodos, MissedTodoAlarm{
 							TodoSummary: td.Summary,
 							AlarmID:     a.ID,
 							TriggerAt:   t,
 							Age:         now.Sub(t),
+							Delivery:    delivery,
 						})
 					})
 				}
@@ -234,61 +263,85 @@ func (s *Service) CheckMissed(ctx context.Context, now time.Time, lookback time.
 }
 
 // collectMissedTriggers walks every repeat trigger of an alarm whose initial
-// firing is triggerAt. It calls record(t) for each one that is stale (past
-// StaleThreshold) and has no state row per stateExists. stateExists
-// reports whether a state row exists for the (alarm, triggerKey) pair. A real
-// DB error there is treated as "skip" rather than a false-positive miss.
+// firing is triggerAt. For each one that is stale (past StaleThreshold) it
+// reads the delivery state per deliveryState. It calls record(t, delivery)
+// only for a trigger that never reached the user: unclaimed (no row), or a
+// stuck retry/dispatching row. Delivered, acknowledged, and snoozed triggers
+// are skipped. A real DB error is treated as "skip" rather than a
+// false-positive miss.
 func (s *Service) collectMissedTriggers(
 	ctx context.Context,
 	triggerAt time.Time,
 	a model.Alarm,
 	now time.Time,
-	stateExists func(ctx context.Context, alarmID int64, triggerKey string) (bool, error),
-	record func(t time.Time),
+	deliveryState func(ctx context.Context, alarmID int64, triggerKey string) (string, bool, error),
+	record func(t time.Time, delivery string),
 ) {
 	for _, t := range buildRepeatTriggers(triggerAt, a.Repeat, a.Duration) {
 		if t.After(now) || now.Sub(t) <= StaleThreshold {
 			continue // not stale yet
 		}
 		triggerKey := t.UTC().Format(time.RFC3339)
-		exists, err := stateExists(ctx, a.ID, triggerKey)
-		if err != nil || exists {
-			continue // already fired/acknowledged, or DB error: skip
+		delivery, handled, err := deliveryState(ctx, a.ID, triggerKey)
+		if err != nil || handled {
+			continue // delivered/acked/snoozed, or DB error: skip
 		}
-		record(t)
+		record(t, delivery)
 	}
 }
 
-// eventAlarmStateExists reports whether an alarm_state row exists for the
-// given event alarm and trigger key.
-func (s *Service) eventAlarmStateExists(ctx context.Context, alarmID int64, triggerKey string) (bool, error) {
-	_, err := s.q.GetAlarmState(ctx, storage.GetAlarmStateParams{
+// eventAlarmDeliveryState classifies one event trigger for missed
+// reporting. handled is true when the trigger reached the user or is owned
+// by snooze/dismissal and must not be reported. With handled false, the
+// returned state is DispatchUnclaimed, DispatchRetry, or
+// DispatchDispatching.
+func (s *Service) eventAlarmDeliveryState(ctx context.Context, alarmID int64, triggerKey string) (state string, handled bool, err error) {
+	st, err := s.q.GetAlarmState(ctx, storage.GetAlarmStateParams{
 		AlarmID:   alarmID,
 		TriggerAt: triggerKey,
 	})
 	if err == nil {
-		return true, nil
+		state, handled := classifyMissedDelivery(st.DispatchStatus, st.AckedAt != nil, st.SnoozedTo != nil)
+		return state, handled, nil
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return DispatchUnclaimed, false, nil
 	}
-	return false, err
+	return "", false, err
 }
 
-// todoAlarmStateExists reports whether a todo_alarm_state row exists for the
-// given todo alarm and trigger key.
-func (s *Service) todoAlarmStateExists(ctx context.Context, alarmID int64, triggerKey string) (bool, error) {
-	_, err := s.q.GetTodoAlarmState(ctx, storage.GetTodoAlarmStateParams{
+// todoAlarmDeliveryState is the todo-alarm counterpart of
+// eventAlarmDeliveryState.
+func (s *Service) todoAlarmDeliveryState(ctx context.Context, alarmID int64, triggerKey string) (state string, handled bool, err error) {
+	st, err := s.q.GetTodoAlarmState(ctx, storage.GetTodoAlarmStateParams{
 		AlarmID:   alarmID,
 		TriggerAt: triggerKey,
 	})
 	if err == nil {
-		return true, nil
+		state, handled := classifyMissedDelivery(st.DispatchStatus, st.AckedAt != nil, st.SnoozedTo != nil)
+		return state, handled, nil
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return DispatchUnclaimed, false, nil
 	}
-	return false, err
+	return "", false, err
+}
+
+// classifyMissedDelivery maps a stored state row to a missed-report
+// verdict. Delivered, acknowledged, and snoozed rows are handled (never
+// reported). An unfinished dispatch is reported with its stored status.
+func classifyMissedDelivery(status string, acked, snoozed bool) (state string, handled bool) {
+	if acked || snoozed || status == DispatchDelivered {
+		return "", true
+	}
+	switch status {
+	case DispatchRetry, DispatchDispatching:
+		return status, false
+	default:
+		// Defensive: an unknown status is a finished row for reporting
+		// purposes. Do not raise a false miss for it.
+		return "", true
+	}
 }
 
 // checkEventAlarms finds due event alarms
@@ -302,6 +355,8 @@ func (s *Service) checkEventAlarms(ctx context.Context, now time.Time) ([]DueAla
 	forward := baseForwardWindow + maxLeadTime(triggers)
 	windowStart := now.Add(-StaleThreshold - 24*time.Hour)
 	windowEnd := now.Add(forward)
+	nowStr := now.UTC().Format(time.RFC3339)
+	leaseBoundaryStr := now.Add(-DispatchLease).UTC().Format(time.RFC3339)
 
 	recurSvc := recurrence.NewService(s.db, s.q)
 	expandedEvents, err := recurSvc.ListExpandedEvents(ctx, windowStart, windowEnd, recurrence.SkipCategories())
@@ -356,12 +411,28 @@ func (s *Service) checkEventAlarms(ctx context.Context, now time.Time) ([]DueAla
 				}
 
 				triggerKey := t.UTC().Format(time.RFC3339)
-				_, err = s.q.GetAlarmState(ctx, storage.GetAlarmStateParams{
+				st, err := s.q.GetAlarmState(ctx, storage.GetAlarmStateParams{
 					AlarmID:   a.ID,
 					TriggerAt: triggerKey,
 				})
 				if err == nil {
-					continue // already fired/acknowledged
+					// A delivered or acknowledged trigger is complete. A
+					// retry-due row and an orphaned dispatch are due again.
+					// A live dispatch inside its lease is owned by another
+					// checker. A snoozed row is owned by the snooze path.
+					if !recoverableDispatch(st.DispatchStatus, st.AckedAt != nil, st.SnoozedTo != nil,
+						st.ClaimedAt, st.RetryAt, nowStr, leaseBoundaryStr) {
+						continue
+					}
+					due = append(due, DueAlarm{
+					Event:     instanceEvent,
+					Alarm:     a,
+					TriggerAt: t,
+					StateID:   st.ID,
+					Attempts:  int(st.Attempts) + 1,
+					Claim:     ClaimRecover,
+				})
+				continue
 				}
 				if !errors.Is(err, sql.ErrNoRows) {
 					// Transient DB error (e.g. SQLITE_BUSY): we can't tell
@@ -395,8 +466,7 @@ func (s *Service) checkTodoAlarms(ctx context.Context, now time.Time) ([]TodoDue
 		return nil, nil
 	}
 
-	todoSvc := NewTodoService(s.db, s.q, s.todos)
-	return todoSvc.CheckTodos(ctx, now)
+	return s.todoSvc().CheckTodos(ctx, now)
 }
 
 // computeTriggerTimeForInstance calculates trigger time for a specific event instance
@@ -545,22 +615,27 @@ func (s *Service) ListExpiredSnoozed(ctx context.Context, now time.Time) ([]DueA
 			Alarm:     matched,
 			TriggerAt: triggerAt,
 			StateID:   st.ID,
+			Claim:     ClaimRefire,
 		})
 	}
 	return due, nil
 }
 
-// MarkFired records that an alarm has been fired and returns the new state ID.
-// It returns ErrNotFireable when the stored action is sync-only. The insert
+// MarkFired claims a fresh trigger. The row enters the dispatching state
+// and stays there until CompleteAlarmDelivery or ScheduleAlarmRetry. It
+// returns ErrNotFireable when the stored action is sync-only. The insert
 // reads the action in the same statement, so a sync pull that disables the
-// alarm after the check loop reads it cannot leave a fired state behind.
+// alarm after the check loop reads it cannot leave a claimed state behind.
 func (s *Service) MarkFired(ctx context.Context, da DueAlarm) (int64, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339)
 	st, err := s.q.CreateAlarmState(ctx, storage.CreateAlarmStateParams{
-		AlarmID:   da.Alarm.ID,
-		EventID:   da.Event.ID,
-		TriggerAt: da.TriggerAt.UTC().Format(time.RFC3339),
-		FiredAt:   &now,
+		AlarmID:    da.Alarm.ID,
+		EventID:    da.Event.ID,
+		TriggerAt:  da.TriggerAt.UTC().Format(time.RFC3339),
+		FiredAt:    &nowStr,
+		ClaimedAt:  &nowStr,
+		ClaimToken: &s.claimToken,
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNotFireable
@@ -571,28 +646,88 @@ func (s *Service) MarkFired(ctx context.Context, da DueAlarm) (int64, error) {
 	return st.ID, nil
 }
 
-// MarkTodoFired records that a todo alarm has been fired and returns the new state ID.
-func (s *Service) MarkTodoFired(ctx context.Context, tda TodoDueAlarm) (int64, error) {
-	todoSvc := NewTodoService(s.db, s.q, s.todos)
-	return todoSvc.MarkTodoAlarmFired(ctx, tda.Alarm.ID, tda.Todo.ID, tda.TriggerAt)
-}
-
-// MarkTodoRefired re-fires a snoozed todo alarm. It clears the snooze. The
-// UPDATE is gated on snoozed_to IS NOT NULL so it acts as an atomic claim.
-// When two checkers overlap, both observe the expired-snoozed row. Only
-// the UPDATE that clears snoozed_to first affects a row. claimed reports
-// whether this caller won the claim. A false claimed means another checker
-// already re-fired the alarm. This caller must not dispatch a duplicate.
-func (s *Service) MarkTodoRefired(ctx context.Context, stateID int64) (claimed bool, err error) {
-	now := time.Now().UTC().Format(time.RFC3339)
-	rows, err := s.q.RefireTodoAlarmState(ctx, storage.RefireTodoAlarmStateParams{
-		FiredAt: &now,
-		ID:      stateID,
+// RecoverAlarmDispatch atomically takes over a retry-due row or a dispatch
+// whose lease expired. It returns claimed=false when another checker won,
+// when the row is not due yet, or when it is no longer recoverable. The
+// caller must dispatch nothing in that case.
+func (s *Service) RecoverAlarmDispatch(ctx context.Context, stateID int64, now time.Time) (claimed bool, err error) {
+	nowStr := now.UTC().Format(time.RFC3339)
+	boundaryStr := now.Add(-DispatchLease).UTC().Format(time.RFC3339)
+	rows, err := s.q.TakeoverAlarmDispatch(ctx, storage.TakeoverAlarmDispatchParams{
+		ID:            stateID,
+		ClaimedAt:     &nowStr,
+		ClaimToken:    &s.claimToken,
+		FiredAt:       &nowStr,
+		Now:           &nowStr,
+		LeaseBoundary: &boundaryStr,
 	})
 	if err != nil {
 		return false, err
 	}
 	return rows > 0, nil
+}
+
+// CompleteAlarmDelivery marks a claimed dispatch delivered. Only this
+// instance token may complete the row. delivered=false means another
+// instance took the lease over. This process then stops touching the row.
+func (s *Service) CompleteAlarmDelivery(ctx context.Context, stateID int64, now time.Time) (delivered bool, err error) {
+	nowStr := now.UTC().Format(time.RFC3339)
+	rows, err := s.q.CompleteAlarmDispatch(ctx, storage.CompleteAlarmDispatchParams{
+		ID:          stateID,
+		ClaimToken:  &s.claimToken,
+		DeliveredAt: &nowStr,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// ScheduleAlarmRetry releases a failed dispatch to the retry state. The
+// backoff follows RetryDelay for the given attempt count. It returns the
+// next due time. claimed=false means this instance no longer owns the row.
+func (s *Service) ScheduleAlarmRetry(ctx context.Context, stateID int64, attempts int, cause error, now time.Time) (retryAt time.Time, claimed bool, err error) {
+	retryAt = now.Add(RetryDelay(attempts))
+	retryStr := retryAt.UTC().Format(time.RFC3339)
+	errText := dispatchErrorText(cause)
+	rows, err := s.q.RetryAlarmDispatch(ctx, storage.RetryAlarmDispatchParams{
+		ID:         stateID,
+		ClaimToken: &s.claimToken,
+		RetryAt:    &retryStr,
+		LastError:  &errText,
+	})
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return retryAt, rows > 0, nil
+}
+
+// MarkTodoFired claims a fresh todo trigger and returns the new state ID.
+func (s *Service) MarkTodoFired(ctx context.Context, tda TodoDueAlarm) (int64, error) {
+	return s.todoSvc().MarkTodoAlarmFired(ctx, tda.Alarm.ID, tda.Todo.ID, tda.TriggerAt)
+}
+
+// MarkTodoRefired claims an expired-snoozed todo refire. The UPDATE is
+// gated on snoozed_to IS NOT NULL, so it acts as an atomic claim. claimed
+// is false when another checker won. The new dispatch starts in the
+// dispatching state and follows the same lifecycle as a fresh trigger.
+func (s *Service) MarkTodoRefired(ctx context.Context, stateID int64) (claimed bool, err error) {
+	return s.todoSvc().MarkTodoAlarmRefired(ctx, stateID)
+}
+
+// RecoverTodoAlarmDispatch takes over a retry-due or orphaned todo dispatch.
+func (s *Service) RecoverTodoAlarmDispatch(ctx context.Context, stateID int64, now time.Time) (claimed bool, err error) {
+	return s.todoSvc().RecoverTodoAlarmDispatch(ctx, stateID, now)
+}
+
+// CompleteTodoDelivery marks a claimed todo dispatch delivered.
+func (s *Service) CompleteTodoDelivery(ctx context.Context, stateID int64, now time.Time) (delivered bool, err error) {
+	return s.todoSvc().CompleteTodoDelivery(ctx, stateID, now)
+}
+
+// ScheduleTodoRetry releases a failed todo dispatch to the retry state.
+func (s *Service) ScheduleTodoRetry(ctx context.Context, stateID int64, attempts int, cause error, now time.Time) (retryAt time.Time, claimed bool, err error) {
+	return s.todoSvc().ScheduleTodoRetry(ctx, stateID, attempts, cause, now)
 }
 
 // Dismiss acknowledges a fired alarm so it will not show as pending.
@@ -615,17 +750,18 @@ func (s *Service) Dismiss(ctx context.Context, stateID int64) error {
 	})
 }
 
-// MarkRefired updates a snoozed alarm's fired_at and clears snoozed_to. The
-// UPDATE is gated on snoozed_to IS NOT NULL so it acts as an atomic claim.
-// When two checkers overlap, both observe the expired-snoozed row. Only
-// the UPDATE that clears snoozed_to first affects a row. claimed reports
-// whether this caller won the claim. A false claimed means another checker
-// already re-fired the alarm. This caller must not dispatch a duplicate.
+// MarkRefired claims an expired-snoozed refire. The UPDATE clears
+// snoozed_to and starts a fresh dispatch cycle. It is gated on
+// snoozed_to IS NOT NULL, so it acts as an atomic claim. When two checkers
+// overlap, only the first UPDATE affects a row. claimed is false for the
+// loser. This caller must not dispatch a duplicate.
 func (s *Service) MarkRefired(ctx context.Context, stateID int64) (claimed bool, err error) {
-	now := time.Now().UTC().Format(time.RFC3339)
+	nowStr := time.Now().UTC().Format(time.RFC3339)
 	rows, err := s.q.RefireAlarmState(ctx, storage.RefireAlarmStateParams{
-		FiredAt: &now,
-		ID:      stateID,
+		FiredAt:    &nowStr,
+		ClaimedAt:  &nowStr,
+		ClaimToken: &s.claimToken,
+		ID:         stateID,
 	})
 	if err != nil {
 		return false, err
@@ -760,8 +896,7 @@ func (s *Service) DismissTodoAlarm(ctx context.Context, stateID int64) error {
 	if st.AckedAt != nil {
 		return fmt.Errorf("todo alarm state %d already dismissed", stateID)
 	}
-	todoSvc := NewTodoService(s.db, s.q, s.todos)
-	return todoSvc.DismissTodoAlarm(ctx, stateID)
+	return s.todoSvc().DismissTodoAlarm(ctx, stateID)
 }
 
 // SnoozeTodoAlarm reschedules a fired todo alarm to fire again at the given time.
@@ -776,8 +911,7 @@ func (s *Service) SnoozeTodoAlarm(ctx context.Context, stateID int64, until time
 	if st.AckedAt != nil {
 		return fmt.Errorf("todo alarm state %d is already dismissed", stateID)
 	}
-	todoSvc := NewTodoService(s.db, s.q, s.todos)
-	return todoSvc.SnoozeTodoAlarm(ctx, stateID, until)
+	return s.todoSvc().SnoozeTodoAlarm(ctx, stateID, until)
 }
 
 // computeTriggerTime calculates the absolute trigger time for an alarm on an event.

@@ -77,35 +77,54 @@ func isAlarmAlreadyClaimed(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-// fireResult reports the outcome of a mark-and-fire attempt. The three
-// outcomes are mutually distinguishable. Callers then never record a false
-// "fired" entry:
+// fireResult reports the outcome of a claim-and-dispatch attempt.
 //
-//   - Fired == true: the alarm was claimed and the notification dispatched
-//     (FireErr may still report a delivery failure). StateID is the claimed row.
 //   - Fired == false, MarkErr == nil: the claim was lost to a concurrent
-//     checker (benign UNIQUE-constraint race). Nothing was dispatched.
-//     Callers must emit no record for it.
-//   - MarkErr != nil: a genuine mark failure. The daemon's failure breaker
-//     counts it. The alarm re-fires next tick.
+//     checker (a benign UNIQUE race, a lost refire, or a takeover that lost
+//     to another checker). Nothing was dispatched on this attempt. Callers
+//     emit no record for it.
+//   - Fired == true, FireErr == nil: a backend completed. Delivered says
+//     whether this checker also marked the row delivered. A false Delivered
+//     means the lease was lost after the send. Another checker owns the row.
+//   - Fired == true, FireErr != nil, Retry == true: every channel failed.
+//     The row waits for retry at RetryAt. A later check delivers it again.
+//   - MarkErr != nil: a genuine state-row failure during claim, completion,
+//     or retry release. The daemon failure breaker counts it. A claimed but
+//     unfinished row stays recoverable.
 type fireResult struct {
-	StateID int64
-	Fired   bool
-	MarkErr error
-	FireErr error
+	StateID   int64
+	Attempts  int
+	Fired     bool
+	Delivered bool
+	Retry     bool
+	RetryAt   time.Time
+	MarkErr   error
+	FireErr   error
 }
 
-// dueClaim carries the per-domain pieces of a mark-and-fire attempt. The
-// event and todo paths differ only in their mark calls, display name, and
-// unified view; the claim protocol is identical.
+// dueClaim carries the per-domain pieces of a claim-and-dispatch attempt.
+// The event and todo paths differ only in their storage calls, display
+// name, and unified view. The lifecycle protocol is identical.
 type dueClaim struct {
-	// stateID is 0 for a fresh fire, or the snoozed state to re-fire.
-	stateID int64
+	// stateID is 0 for a fresh fire. It is the existing row id for a
+	// snooze refire or a recovery.
+	stateID  int64
+	kind     alarm.ClaimKind
+	attempts int
 	// markRefire claims an expired-snoozed refire. claimed == false means
 	// another checker won.
 	markRefire func(ctx context.Context, stateID int64) (bool, error)
+	// recover claims a retry-due row or an orphaned dispatch. claimed ==
+	// false means another checker won or the row is not due yet.
+	recover func(ctx context.Context, stateID int64, now time.Time) (bool, error)
 	// markFired claims a fresh fire. It returns the new state row id.
 	markFired func(ctx context.Context) (int64, error)
+	// complete marks a claimed dispatch delivered. owned == false means
+	// this checker lost the lease.
+	complete func(ctx context.Context, stateID int64, now time.Time) (bool, error)
+	// scheduleRetry releases a failed dispatch. It returns the next due
+	// time. owned == false means another checker owns the row.
+	scheduleRetry func(ctx context.Context, stateID, attempts int, cause error, now time.Time) (time.Time, bool, error)
 	// summary is the display name for error lines. It arrives sanitized.
 	summary string
 	// action is the alarm action for error lines.
@@ -116,62 +135,109 @@ type dueClaim struct {
 	due alarm.DueAlarm
 }
 
-// claimAndFireAlarm runs the shared mark-and-fire protocol. Only on a
-// successful claim does it dispatch the notification. For a fresh fire
-// (stateID == 0) the claim is the INSERT performed by MarkFired. The
-// (alarm_id, trigger_at) UNIQUE index guards it. When two checkers overlap,
-// both observe "no state" and both try to insert. Only one wins. The loser's
-// UNIQUE-constraint error is reported as a non-fired, non-error result.
-// Callers then suppress output for it.
+// claimAndFireAlarm runs the shared claim, dispatch, and settle protocol.
 //
-// The refire path (stateID != 0, an expired-snoozed alarm) uses the refire
-// mark. Its UPDATE is gated on snoozed_to IS NOT NULL. When two checkers
-// overlap, both observe the expired-snoozed row. Only the UPDATE that clears
-// snoozed_to first affects a row and wins the claim. The loser sees
-// claimed == false. That is likewise a non-fired, non-error result.
+// The claim is one atomic statement per kind. A fresh fire INSERTs the row;
+// the (alarm_id, trigger_at) UNIQUE index makes the insert the claim. A
+// snooze refire runs the UPDATE gated on snoozed_to IS NOT NULL. A recovery
+// runs the UPDATE gated on retry_at or the expired dispatch lease. When
+// two checkers overlap, the loser sees a benign lost claim. It dispatches
+// nothing and returns an empty result.
+//
+// After the claim, exactly one dispatch runs. Success marks the row
+// delivered through a token-gated UPDATE. The row then never re-fires.
+// Failure of every channel releases the row to the retry state with a
+// deterministic retry_at. The next due check claims and dispatches it
+// again. A process death between claim and settle leaves dispatching; the
+// expired lease makes the row recoverable by the next service instance.
 func claimAndFireAlarm(ctx context.Context, c dueClaim, policy alarmExecutionPolicy) fireResult {
+	now := time.Now()
 	stateID := c.stateID
+	attempts := c.attempts
 	var markErr error
 	op := "mark-fired"
-	if stateID != 0 {
+	switch c.kind {
+	case alarm.ClaimRefire:
 		op = "mark-refired"
 		var claimed bool
-		if claimed, markErr = c.markRefire(ctx, stateID); markErr == nil && !claimed {
+		claimed, markErr = c.markRefire(ctx, stateID)
+		if markErr == nil && !claimed {
 			return fireResult{} // another checker already re-fired this alarm
 		}
-	} else {
+		attempts = 1
+	case alarm.ClaimRecover:
+		op = "recover-dispatch"
+		var claimed bool
+		claimed, markErr = c.recover(ctx, stateID, now)
+		if markErr == nil && !claimed {
+			return fireResult{} // not due yet, or another checker won
+		}
+	default:
 		var newID int64
-		if newID, markErr = c.markFired(ctx); markErr == nil {
+		newID, markErr = c.markFired(ctx)
+		if markErr == nil {
 			stateID = newID
 		}
+		attempts = 1
 	}
 	if markErr != nil {
 		if isAlarmAlreadyClaimed(markErr) {
-			return fireResult{} // another checker already fired this alarm
+			return fireResult{} // another checker already claimed this alarm
 		}
 		if errors.Is(markErr, alarm.ErrNotFireable) {
 			return fireResult{} // a sync pull disabled this alarm (issue #579)
 		}
 		fmt.Fprintf(os.Stderr, "chroncal: %s error: %s=%q: %v\n", op, c.label, c.summary, markErr)
-		return fireResult{StateID: stateID, MarkErr: markErr}
+		return fireResult{StateID: stateID, Attempts: attempts, MarkErr: markErr}
 	}
 
 	fireErr := fireAlarmFn(c.due, policy)
-	if fireErr != nil {
-		fmt.Fprintf(os.Stderr, "chroncal: alarm error: %s (%s=%q action=%s): %v\n",
-			c.due.TriggerAt.Local().Format("15:04"), c.label, c.summary, c.action, fireErr)
+	if fireErr == nil {
+		owned, err := c.complete(ctx, stateID, now)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "chroncal: complete-dispatch error: %s=%q: %v\n", c.label, c.summary, err)
+			return fireResult{StateID: stateID, Attempts: attempts, Fired: true, Delivered: owned, MarkErr: err}
+		}
+		if !owned {
+			// The lease expired while the backend ran. Another checker now
+			// owns the trigger. The send still went out, so report it as
+			// dispatched, but do not touch the row again.
+			fmt.Fprintf(os.Stderr, "chroncal: warning: dispatch lease lost after delivery: %s=%q\n", c.label, c.summary)
+		}
+		return fireResult{StateID: stateID, Attempts: attempts, Fired: true, Delivered: owned}
 	}
-	return fireResult{StateID: stateID, Fired: true, FireErr: fireErr}
+
+	retryAt, owned, err := c.scheduleRetry(ctx, int(stateID), attempts, fireErr, now)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "chroncal: schedule-retry error: %s=%q: %v\n", c.label, c.summary, err)
+		return fireResult{StateID: stateID, Attempts: attempts, Fired: true, FireErr: fireErr, MarkErr: err}
+	}
+	if !owned {
+		// Another checker took the lease over while the backend ran. That
+		// checker owns delivery and the retry. Emit nothing.
+		return fireResult{}
+	}
+	fmt.Fprintf(os.Stderr, "chroncal: alarm error: %s (%s=%q action=%s attempt=%d): %v; retry at %s\n",
+		c.due.TriggerAt.Local().Format("15:04"), c.label, c.summary, c.action, attempts, fireErr,
+		retryAt.Local().Format("15:04"))
+	return fireResult{StateID: stateID, Attempts: attempts, Fired: true, Retry: true, RetryAt: retryAt, FireErr: fireErr}
 }
 
-// markAndFireEventAlarm claims and fires one event alarm through the shared
-// protocol.
+// markAndFireEventAlarm claims and dispatches one event alarm through the
+// shared lifecycle protocol.
 func markAndFireEventAlarm(ctx context.Context, a *app.App, da alarm.DueAlarm, policy alarmExecutionPolicy) fireResult {
 	return claimAndFireAlarm(ctx, dueClaim{
 		stateID:    da.StateID,
+		kind:       da.Claim,
+		attempts:   da.Attempts,
 		markRefire: a.Alarms.MarkRefired,
+		recover:    a.Alarms.RecoverAlarmDispatch,
 		markFired: func(ctx context.Context) (int64, error) {
 			return a.Alarms.MarkFired(ctx, da)
+		},
+		complete: a.Alarms.CompleteAlarmDelivery,
+		scheduleRetry: func(ctx context.Context, stateID, attempts int, cause error, now time.Time) (time.Time, bool, error) {
+			return a.Alarms.ScheduleAlarmRetry(ctx, int64(stateID), attempts, cause, now)
 		},
 		summary: safeText(da.Event.Title),
 		action:  da.Alarm.Action,
@@ -180,14 +246,21 @@ func markAndFireEventAlarm(ctx context.Context, a *app.App, da alarm.DueAlarm, p
 	}, policy)
 }
 
-// markAndFireTodoAlarm claims and fires one todo alarm through the shared
-// protocol.
+// markAndFireTodoAlarm claims and dispatches one todo alarm through the
+// shared lifecycle protocol.
 func markAndFireTodoAlarm(ctx context.Context, a *app.App, tda alarm.TodoDueAlarm, policy alarmExecutionPolicy) fireResult {
 	return claimAndFireAlarm(ctx, dueClaim{
 		stateID:    tda.StateID,
+		kind:       tda.Claim,
+		attempts:   tda.Attempts,
 		markRefire: a.Alarms.MarkTodoRefired,
+		recover:    a.Alarms.RecoverTodoAlarmDispatch,
 		markFired: func(ctx context.Context) (int64, error) {
 			return a.Alarms.MarkTodoFired(ctx, tda)
+		},
+		complete: a.Alarms.CompleteTodoDelivery,
+		scheduleRetry: func(ctx context.Context, stateID, attempts int, cause error, now time.Time) (time.Time, bool, error) {
+			return a.Alarms.ScheduleTodoRetry(ctx, int64(stateID), attempts, cause, now)
 		},
 		summary: safeText(tda.Todo.Summary),
 		action:  tda.Alarm.Action,
@@ -259,10 +332,15 @@ Or in the config file ($XDG_CONFIG_HOME/chroncal/config.toml):
 
 Environment variables override config file values.
 
-Each fired alarm is recorded in the database so it will not fire again on
-subsequent checks. Snoozed alarms whose snooze-until time has expired
-are also re-fired. If no alarms are due, the command produces no output
-and exits 0.`,
+An alarm is recorded as delivered only after a notification backend
+completes. If every backend fails, the alarm enters the retry state. The
+next check retries it on a fixed backoff while it is inside the 24-hour
+window. A process that exits after the claim but before delivery leaves
+the alarm in the dispatching state. Another process takes it over five
+minutes later. A delivered alarm does not fire again. A snoozed alarm
+whose snooze-until time has expired is re-fired through the same
+lifecycle. If no alarms are due, the command produces no output and
+exits 0.`,
 		Example: `  # One-shot check (suitable for cron / systemd timer)
   chroncal alarm check
 
@@ -318,19 +396,19 @@ func runAlarmCheck(ctx context.Context, a *app.App, w io.Writer, now time.Time, 
 		}
 
 		if outputFmt != "text" {
-			status := "fired"
-			if res.FireErr != nil {
-				status = fmt.Sprintf("error: %v", res.FireErr)
-			}
-			results = append(results, map[string]any{
+			rec := map[string]any{
 				"event_id":   da.Event.ID,
 				"event":      da.Event.Title,
 				"alarm_id":   da.Alarm.ID,
 				"state_id":   res.StateID,
 				"action":     da.Alarm.Action,
 				"trigger_at": da.TriggerAt.UTC().Format(time.RFC3339),
-				"status":     status,
-			})
+				"status":     checkStatusValue(res),
+				"delivery":   checkDeliveryValue(res),
+				"attempts":   res.Attempts,
+			}
+			addRetryFields(rec, res)
+			results = append(results, rec)
 		} else if res.FireErr == nil {
 			writeAlarmCheckLine(w, da.TriggerAt, da.Alarm.Action, da.Event.Title, false)
 		}
@@ -343,19 +421,19 @@ func runAlarmCheck(ctx context.Context, a *app.App, w io.Writer, now time.Time, 
 		}
 
 		if outputFmt != "text" {
-			status := "fired"
-			if res.FireErr != nil {
-				status = fmt.Sprintf("error: %v", res.FireErr)
-			}
-			results = append(results, map[string]any{
+			rec := map[string]any{
 				"todo_id":    tda.Todo.ID,
 				"todo":       tda.Todo.Summary,
 				"alarm_id":   tda.Alarm.ID,
 				"state_id":   res.StateID,
 				"action":     tda.Alarm.Action,
 				"trigger_at": tda.TriggerAt.UTC().Format(time.RFC3339),
-				"status":     status,
-			})
+				"status":     checkStatusValue(res),
+				"delivery":   checkDeliveryValue(res),
+				"attempts":   res.Attempts,
+			}
+			addRetryFields(rec, res)
+			results = append(results, rec)
 		} else if res.FireErr == nil {
 			writeAlarmCheckLine(w, tda.TriggerAt, tda.Alarm.Action, tda.Todo.Summary, true)
 		}
@@ -365,6 +443,74 @@ func runAlarmCheck(ctx context.Context, a *app.App, w io.Writer, now time.Time, 
 		return printOutput(w, results)
 	}
 	return nil
+}
+
+// checkStatusValue keeps the historical check-record status field. "fired"
+// means a backend completed. An "error: ..." value means every channel
+// failed and the row waits for retry. New consumers should read the
+// explicit delivery field.
+func checkStatusValue(res fireResult) string {
+	if res.FireErr != nil {
+		return fmt.Sprintf("error: %v", res.FireErr)
+	}
+	return "fired"
+}
+
+// checkDeliveryValue reports the dispatch lifecycle state in a check
+// record: delivered (a backend completed) or retry (every channel failed
+// and another attempt is scheduled).
+func checkDeliveryValue(res fireResult) string {
+	if res.FireErr != nil {
+		return alarm.DispatchRetry
+	}
+	return alarm.DispatchDelivered
+}
+
+// addRetryFields adds the retry schedule and the failure cause to a check
+// record for a dispatch that entered the retry state.
+func addRetryFields(rec map[string]any, res fireResult) {
+	if !res.Retry {
+		return
+	}
+	rec["retry_at"] = res.RetryAt.UTC().Format(time.RFC3339)
+	if res.FireErr != nil {
+		rec["error"] = res.FireErr.Error()
+	}
+}
+
+// addPendingDispatchFields adds the lifecycle fields shared by event and
+// todo entries of "alarm list". Existing fields stay unchanged.
+func addPendingDispatchFields(rec map[string]any, status string, attempts int64, retryAt, lastError, deliveredAt *string) {
+	rec["delivery"] = status
+	rec["attempts"] = attempts
+	rec["retry_at"] = storage.NullableToString(retryAt)
+	rec["last_error"] = storage.NullableToString(lastError)
+	rec["delivered_at"] = storage.NullableToString(deliveredAt)
+}
+
+// pendingDispatchNote renders the text suffix for a pending state row. A
+// snoozed row gets no dispatch note: the snooze time is the next visible
+// action. A retry row shows the next attempt time. A dispatching row shows
+// the in-flight marker. Delivered rows get no note.
+func pendingDispatchNote(snoozed bool, status string, retryAt *string) string {
+	if snoozed {
+		return ""
+	}
+	switch status {
+	case alarm.DispatchRetry:
+		if retryAt == nil {
+			return " (retry pending)"
+		}
+		at := *retryAt
+		if t, err := time.Parse(time.RFC3339, at); err == nil {
+			at = t.Local().Format("15:04")
+		}
+		return " (retry at " + at + ")"
+	case alarm.DispatchDispatching:
+		return " (sending)"
+	default:
+		return ""
+	}
 }
 
 func alarmListCmd() *cobra.Command {
@@ -382,10 +528,19 @@ Both event and todo alarms are shown. Todo alarm IDs are prefixed with "t"
 prefixed form with "alarm dismiss" and "alarm snooze".
 
 Text output columns:
-  [ID]  TRIGGER_TIME  ACTION  TITLE  (snoozed to HH:MM)
+  [ID]  TRIGGER_TIME  ACTION  TITLE  (snoozed to HH:MM)  (state note)
+
+The state note shows the dispatch lifecycle. It is empty for a delivered
+alarm. "retry at HH:MM" marks a retry-state alarm. "sending" marks a
+dispatching alarm that a checker owns right now.
 
 JSON output fields (-o json):
-  id, type, alarm_id, event_id/todo_id, title, action, trigger_at, fired_at, snoozed_to
+  id, type, alarm_id, event_id/todo_id, title, action, trigger_at,
+  fired_at, snoozed_to, delivery, attempts, retry_at, last_error,
+  delivered_at
+
+The delivery field is "delivered", "dispatching", or "retry". A retry
+entry also carries retry_at and last_error.
 
 Dismissed alarms are permanently removed from this list.`,
 		Example: `  # List pending alarms
@@ -486,7 +641,7 @@ Dismissed alarms are permanently removed from this list.`,
 			if outputFmt != "text" {
 				var items []map[string]any
 				for _, p := range enriched {
-					items = append(items, map[string]any{
+					rec := map[string]any{
 						"id":         p.ID,
 						"type":       "event",
 						"alarm_id":   p.State.AlarmID,
@@ -496,10 +651,13 @@ Dismissed alarms are permanently removed from this list.`,
 						"trigger_at": p.State.TriggerAt,
 						"fired_at":   storage.NullableToString(p.State.FiredAt),
 						"snoozed_to": storage.NullableToString(p.State.SnoozedTo),
-					})
+					}
+					addPendingDispatchFields(rec, p.State.DispatchStatus, p.State.Attempts,
+						p.State.RetryAt, p.State.LastError, p.State.DeliveredAt)
+					items = append(items, rec)
 				}
 				for _, p := range enrichedTodos {
-					items = append(items, map[string]any{
+					rec := map[string]any{
 						"id":         p.ID,
 						"type":       "todo",
 						"alarm_id":   p.State.AlarmID,
@@ -509,7 +667,10 @@ Dismissed alarms are permanently removed from this list.`,
 						"trigger_at": p.State.TriggerAt,
 						"fired_at":   storage.NullableToString(p.State.FiredAt),
 						"snoozed_to": storage.NullableToString(p.State.SnoozedTo),
-					})
+					}
+					addPendingDispatchFields(rec, p.State.DispatchStatus, p.State.Attempts,
+						p.State.RetryAt, p.State.LastError, p.State.DeliveredAt)
+					items = append(items, rec)
 				}
 				return printOutput(w, items)
 			}
@@ -527,7 +688,8 @@ Dismissed alarms are permanently removed from this list.`,
 					}
 					snoozed = fmt.Sprintf(" (snoozed to %s)", snz)
 				}
-				writePendingAlarmLine(w, p.ID, triggerLocal, p.Action, p.Title, false, snoozed)
+				note := pendingDispatchNote(p.State.SnoozedTo != nil, p.State.DispatchStatus, p.State.RetryAt)
+				writePendingAlarmLine(w, p.ID, triggerLocal, p.Action, p.Title, false, snoozed+note)
 			}
 			for _, p := range enrichedTodos {
 				triggerLocal := p.State.TriggerAt
@@ -542,7 +704,8 @@ Dismissed alarms are permanently removed from this list.`,
 					}
 					snoozed = fmt.Sprintf(" (snoozed to %s)", snz)
 				}
-				writePendingAlarmLine(w, p.ID, triggerLocal, p.Action, p.Title, true, snoozed)
+				note := pendingDispatchNote(p.State.SnoozedTo != nil, p.State.DispatchStatus, p.State.RetryAt)
+				writePendingAlarmLine(w, p.ID, triggerLocal, p.Action, p.Title, true, snoozed+note)
 			}
 			return nil
 		},
@@ -824,6 +987,7 @@ system was not running when they became due.`,
 						"title":      m.EventTitle,
 						"trigger_at": m.TriggerAt.UTC().Format(time.RFC3339),
 						"age":        m.Age,
+						"delivery":   m.Delivery,
 					})
 				}
 				for _, m := range missedTodos {
@@ -833,6 +997,7 @@ system was not running when they became due.`,
 						"title":      m.TodoSummary,
 						"trigger_at": m.TriggerAt.UTC().Format(time.RFC3339),
 						"age":        m.Age,
+						"delivery":   m.Delivery,
 					})
 				}
 				return printOutput(w, items)
@@ -845,10 +1010,10 @@ system was not running when they became due.`,
 
 			fmt.Fprintf(w, "Missed alarms (last %d days):\n\n", days)
 			for _, m := range missedEvents {
-				writeMissedAlarmLine(w, m.TriggerAt, m.EventTitle, false, m.Age)
+				writeMissedAlarmLine(w, m.TriggerAt, m.EventTitle, false, m.Age, missedDeliveryNote(m.Delivery))
 			}
 			for _, m := range missedTodos {
-				writeMissedAlarmLine(w, m.TriggerAt, m.TodoSummary, true, m.Age)
+				writeMissedAlarmLine(w, m.TriggerAt, m.TodoSummary, true, m.Age, missedDeliveryNote(m.Delivery))
 			}
 			return nil
 		},

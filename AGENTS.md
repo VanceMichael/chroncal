@@ -89,7 +89,9 @@ The database stores a recurring event as one row with `recurrence_rule`. Each ov
 
 ### Alarms
 
-Triggers are RFC 5545 duration strings (`-PT15M` = 15 minutes before). Absolute triggers use RFC 3339. The `alarm_state` and `todo_alarm_state` tables store the state (`fired_at`, `acknowledged_at`, `snooze_until`). The service skips alarms older than 24 hours (`alarm.StaleThreshold`). The service fires extra alarms at `Duration` intervals, up to the `Repeat` count.
+Triggers are RFC 5545 duration strings (`-PT15M` = 15 minutes before). Absolute triggers use RFC 3339. The `alarm_state` and `todo_alarm_state` tables store the state (`fired_at`, `acknowledged_at`, `snoozed_to`). The service skips alarms older than 24 hours (`alarm.StaleThreshold`). The service fires extra alarms at `Duration` intervals, up to the `Repeat` count.
+
+Each state row carries a dispatch lifecycle in `dispatch_status`: `dispatching` (a checker holds the claim and the notification is in flight), `retry` (every backend failed; `retry_at` holds the next attempt), and `delivered` (a backend or its fallback completed). A trigger with no row is unclaimed. The checker claims with one atomic statement per kind: fresh insert, gated snooze refire, or `TakeoverAlarmDispatch` for retry-due and lease-expired rows. `alarm.DispatchLease` is the fixed takeover boundary. Completion and retry release are token-gated UPDATEs (`claim_token`, one random token per process), so overlapping daemon, check, and snooze-refire processes dispatch one trigger once. A process that exits after the claim leaves a recoverable row. Events and todos use the same semantics. `alarm.RetryDelay` holds the fixed backoff.
 
 ### iCal Round-Trip
 

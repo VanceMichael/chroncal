@@ -23,21 +23,57 @@ func (q *Queries) AcknowledgeAlarmState(ctx context.Context, arg AcknowledgeAlar
 	return err
 }
 
+const completeAlarmDispatch = `-- name: CompleteAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'delivered',
+    claim_token = NULL,
+    delivered_at = ?1,
+    retry_at = NULL,
+    last_error = NULL
+WHERE id = ?2
+  AND claim_token = ?3
+  AND dispatch_status = 'dispatching'
+`
+
+type CompleteAlarmDispatchParams struct {
+	DeliveredAt *string
+	ID          int64
+	ClaimToken  *string
+}
+
+// Finish a dispatch. Only the claim token owner may complete the row, so a
+// stale process that lost its lease cannot overwrite a newer attempt.
+// RowsAffected == 0 means the ownership was lost. The notification may
+// already be sent. The caller must not write the row again.
+func (q *Queries) CompleteAlarmDispatch(ctx context.Context, arg CompleteAlarmDispatchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, completeAlarmDispatch, arg.DeliveredAt, arg.ID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const createAlarmState = `-- name: CreateAlarmState :one
-INSERT INTO alarm_state (alarm_id, event_id, trigger_at, fired_at)
-SELECT ?1, ?2, ?3, ?4
+INSERT INTO alarm_state (
+    alarm_id, event_id, trigger_at, fired_at,
+    dispatch_status, claimed_at, claim_token, attempts
+)
+SELECT ?1, ?2, ?3, ?4,
+       'dispatching', ?5, ?6, 1
 WHERE EXISTS (
     SELECT 1 FROM event_alarms
     WHERE id = ?1 AND action IN ('AUDIO','DISPLAY','EMAIL')
 )
-RETURNING id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to
+RETURNING id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to, dispatch_status, claimed_at, claim_token, attempts, retry_at, last_error, delivered_at
 `
 
 type CreateAlarmStateParams struct {
-	AlarmID   int64
-	EventID   int64
-	TriggerAt string
-	FiredAt   *string
+	AlarmID    int64
+	EventID    int64
+	TriggerAt  string
+	FiredAt    *string
+	ClaimedAt  *string
+	ClaimToken *string
 }
 
 // Claim a fire slot for one alarm. The EXISTS arm reads the action in the
@@ -45,6 +81,10 @@ type CreateAlarmStateParams struct {
 // a sync-only action between the check and the claim cannot leave a fired
 // state for an alarm the user disabled (issue #579). Zero rows means the
 // claim failed, and the caller reports sql.ErrNoRows.
+// The row enters in the "dispatching" state. It reaches "delivered" only
+// through CompleteAlarmDispatch. A failed dispatch moves to "retry", and a
+// process death leaves a stale "dispatching" row the next checker takes
+// over via TakeoverAlarmDispatch.
 // Keep the action list in lockstep with model.FireableAlarmAction.
 func (q *Queries) CreateAlarmState(ctx context.Context, arg CreateAlarmStateParams) (AlarmState, error) {
 	row := q.db.QueryRowContext(ctx, createAlarmState,
@@ -52,6 +92,8 @@ func (q *Queries) CreateAlarmState(ctx context.Context, arg CreateAlarmStatePara
 		arg.EventID,
 		arg.TriggerAt,
 		arg.FiredAt,
+		arg.ClaimedAt,
+		arg.ClaimToken,
 	)
 	var i AlarmState
 	err := row.Scan(
@@ -62,6 +104,13 @@ func (q *Queries) CreateAlarmState(ctx context.Context, arg CreateAlarmStatePara
 		&i.FiredAt,
 		&i.AckedAt,
 		&i.SnoozedTo,
+		&i.DispatchStatus,
+		&i.ClaimedAt,
+		&i.ClaimToken,
+		&i.Attempts,
+		&i.RetryAt,
+		&i.LastError,
+		&i.DeliveredAt,
 	)
 	return i, err
 }
@@ -76,7 +125,7 @@ func (q *Queries) DeleteAlarmStatesByEventID(ctx context.Context, eventID int64)
 }
 
 const getAlarmState = `-- name: GetAlarmState :one
-SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to FROM alarm_state WHERE alarm_id = ? AND trigger_at = ?
+SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to, dispatch_status, claimed_at, claim_token, attempts, retry_at, last_error, delivered_at FROM alarm_state WHERE alarm_id = ? AND trigger_at = ?
 `
 
 type GetAlarmStateParams struct {
@@ -95,12 +144,19 @@ func (q *Queries) GetAlarmState(ctx context.Context, arg GetAlarmStateParams) (A
 		&i.FiredAt,
 		&i.AckedAt,
 		&i.SnoozedTo,
+		&i.DispatchStatus,
+		&i.ClaimedAt,
+		&i.ClaimToken,
+		&i.Attempts,
+		&i.RetryAt,
+		&i.LastError,
+		&i.DeliveredAt,
 	)
 	return i, err
 }
 
 const getAlarmStateByID = `-- name: GetAlarmStateByID :one
-SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to FROM alarm_state WHERE id = ?
+SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to, dispatch_status, claimed_at, claim_token, attempts, retry_at, last_error, delivered_at FROM alarm_state WHERE id = ?
 `
 
 func (q *Queries) GetAlarmStateByID(ctx context.Context, id int64) (AlarmState, error) {
@@ -114,12 +170,19 @@ func (q *Queries) GetAlarmStateByID(ctx context.Context, id int64) (AlarmState, 
 		&i.FiredAt,
 		&i.AckedAt,
 		&i.SnoozedTo,
+		&i.DispatchStatus,
+		&i.ClaimedAt,
+		&i.ClaimToken,
+		&i.Attempts,
+		&i.RetryAt,
+		&i.LastError,
+		&i.DeliveredAt,
 	)
 	return i, err
 }
 
 const listAlarmStatesByEventID = `-- name: ListAlarmStatesByEventID :many
-SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to FROM alarm_state WHERE event_id = ? ORDER BY trigger_at
+SELECT id, alarm_id, event_id, trigger_at, fired_at, acked_at, snoozed_to, dispatch_status, claimed_at, claim_token, attempts, retry_at, last_error, delivered_at FROM alarm_state WHERE event_id = ? ORDER BY trigger_at
 `
 
 func (q *Queries) ListAlarmStatesByEventID(ctx context.Context, eventID int64) ([]AlarmState, error) {
@@ -139,6 +202,13 @@ func (q *Queries) ListAlarmStatesByEventID(ctx context.Context, eventID int64) (
 			&i.FiredAt,
 			&i.AckedAt,
 			&i.SnoozedTo,
+			&i.DispatchStatus,
+			&i.ClaimedAt,
+			&i.ClaimToken,
+			&i.Attempts,
+			&i.RetryAt,
+			&i.LastError,
+			&i.DeliveredAt,
 		); err != nil {
 			return nil, err
 		}
@@ -154,7 +224,7 @@ func (q *Queries) ListAlarmStatesByEventID(ctx context.Context, eventID int64) (
 }
 
 const listExpiredSnoozedAlarmStates = `-- name: ListExpiredSnoozedAlarmStates :many
-SELECT s.id, s.alarm_id, s.event_id, s.trigger_at, s.fired_at, s.acked_at, s.snoozed_to FROM alarm_state s
+SELECT s.id, s.alarm_id, s.event_id, s.trigger_at, s.fired_at, s.acked_at, s.snoozed_to, s.dispatch_status, s.claimed_at, s.claim_token, s.attempts, s.retry_at, s.last_error, s.delivered_at FROM alarm_state s
 JOIN event_alarms a ON a.id = s.alarm_id
 WHERE s.fired_at IS NOT NULL
   AND s.acked_at IS NULL
@@ -183,6 +253,13 @@ func (q *Queries) ListExpiredSnoozedAlarmStates(ctx context.Context, snoozedTo *
 			&i.FiredAt,
 			&i.AckedAt,
 			&i.SnoozedTo,
+			&i.DispatchStatus,
+			&i.ClaimedAt,
+			&i.ClaimToken,
+			&i.Attempts,
+			&i.RetryAt,
+			&i.LastError,
+			&i.DeliveredAt,
 		); err != nil {
 			return nil, err
 		}
@@ -198,7 +275,7 @@ func (q *Queries) ListExpiredSnoozedAlarmStates(ctx context.Context, snoozedTo *
 }
 
 const listPendingAlarmStates = `-- name: ListPendingAlarmStates :many
-SELECT s.id, s.alarm_id, s.event_id, s.trigger_at, s.fired_at, s.acked_at, s.snoozed_to FROM alarm_state s
+SELECT s.id, s.alarm_id, s.event_id, s.trigger_at, s.fired_at, s.acked_at, s.snoozed_to, s.dispatch_status, s.claimed_at, s.claim_token, s.attempts, s.retry_at, s.last_error, s.delivered_at FROM alarm_state s
 JOIN event_alarms a ON a.id = s.alarm_id
 WHERE s.acked_at IS NULL AND s.fired_at IS NOT NULL
   AND a.action IN ('AUDIO','DISPLAY','EMAIL')
@@ -227,6 +304,13 @@ func (q *Queries) ListPendingAlarmStates(ctx context.Context) ([]AlarmState, err
 			&i.FiredAt,
 			&i.AckedAt,
 			&i.SnoozedTo,
+			&i.DispatchStatus,
+			&i.ClaimedAt,
+			&i.ClaimToken,
+			&i.Attempts,
+			&i.RetryAt,
+			&i.LastError,
+			&i.DeliveredAt,
 		); err != nil {
 			return nil, err
 		}
@@ -269,17 +353,71 @@ func (q *Queries) PurgeStaleUnacknowledgedAlarmStates(ctx context.Context, trigg
 }
 
 const refireAlarmState = `-- name: RefireAlarmState :execrows
-UPDATE alarm_state SET fired_at = ?, snoozed_to = NULL
-WHERE id = ? AND snoozed_to IS NOT NULL
+UPDATE alarm_state
+SET fired_at = ?1,
+    snoozed_to = NULL,
+    dispatch_status = 'dispatching',
+    claimed_at = ?2,
+    claim_token = ?3,
+    attempts = 1,
+    retry_at = NULL,
+    last_error = NULL,
+    delivered_at = NULL
+WHERE id = ?4 AND snoozed_to IS NOT NULL
 `
 
 type RefireAlarmStateParams struct {
-	FiredAt *string
-	ID      int64
+	FiredAt    *string
+	ClaimedAt  *string
+	ClaimToken *string
+	ID         int64
 }
 
+// Re-fire an expired snooze and start a new dispatch cycle. The UPDATE is
+// gated on snoozed_to IS NOT NULL, so it acts as an atomic claim between
+// overlapping checkers. The reset fields match a fresh claim: the cycle
+// starts at attempt 1 in "dispatching", with no retry or delivery record.
 func (q *Queries) RefireAlarmState(ctx context.Context, arg RefireAlarmStateParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, refireAlarmState, arg.FiredAt, arg.ID)
+	result, err := q.db.ExecContext(ctx, refireAlarmState,
+		arg.FiredAt,
+		arg.ClaimedAt,
+		arg.ClaimToken,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const retryAlarmDispatch = `-- name: RetryAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'retry',
+    claim_token = NULL,
+    retry_at = ?1,
+    last_error = ?2
+WHERE id = ?3
+  AND claim_token = ?4
+  AND dispatch_status = 'dispatching'
+`
+
+type RetryAlarmDispatchParams struct {
+	RetryAt    *string
+	LastError  *string
+	ID         int64
+	ClaimToken *string
+}
+
+// Release a failed dispatch for a later retry. The same token gate as
+// CompleteAlarmDispatch applies. retry_at carries the deterministic
+// backoff; last_error records the cause for "alarm list".
+func (q *Queries) RetryAlarmDispatch(ctx context.Context, arg RetryAlarmDispatchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, retryAlarmDispatch,
+		arg.RetryAt,
+		arg.LastError,
+		arg.ID,
+		arg.ClaimToken,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -298,4 +436,53 @@ type SnoozeAlarmStateParams struct {
 func (q *Queries) SnoozeAlarmState(ctx context.Context, arg SnoozeAlarmStateParams) error {
 	_, err := q.db.ExecContext(ctx, snoozeAlarmState, arg.SnoozedTo, arg.ID)
 	return err
+}
+
+const takeoverAlarmDispatch = `-- name: TakeoverAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'dispatching',
+    claimed_at = ?1,
+    claim_token = ?2,
+    attempts = attempts + 1,
+    fired_at = ?3,
+    retry_at = NULL
+WHERE id = ?4
+  AND acked_at IS NULL
+  AND snoozed_to IS NULL
+  AND (claim_token IS NULL OR claim_token <> ?2)
+  AND (
+        (dispatch_status = 'retry' AND retry_at IS NOT NULL AND retry_at <= ?5)
+     OR (dispatch_status = 'dispatching' AND (claimed_at IS NULL OR claimed_at <= ?6))
+  )
+`
+
+type TakeoverAlarmDispatchParams struct {
+	ClaimedAt     *string
+	ClaimToken    *string
+	FiredAt       *string
+	ID            int64
+	Now           *string
+	LeaseBoundary *string
+}
+
+// Take over a dispatch that another checker did not finish. The row is
+// eligible when it waits for a retry that is due, or when its dispatch
+// lease expired (the owner process died or hung). A live claim that is
+// inside its lease is not touched. Neither is a snoozed or an acknowledged
+// row. The predicate on claim_token keeps a caller from taking over its
+// own claim. RowsAffected == 0 means this caller lost the race or the row
+// is not due. The caller then dispatches nothing.
+func (q *Queries) TakeoverAlarmDispatch(ctx context.Context, arg TakeoverAlarmDispatchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, takeoverAlarmDispatch,
+		arg.ClaimedAt,
+		arg.ClaimToken,
+		arg.FiredAt,
+		arg.ID,
+		arg.Now,
+		arg.LeaseBoundary,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

@@ -31,17 +31,31 @@ func writePendingAlarmLine(w io.Writer, id, triggerLocal, action, title string, 
 	fmt.Fprintf(w, "  [%s] %s\t%s\t%s%s\n", id, triggerLocal, action, safeText(title), suffix)
 }
 
-func writeMissedAlarmLine(w io.Writer, triggerAt time.Time, title string, isTodo bool, age time.Duration) {
+func writeMissedAlarmLine(w io.Writer, triggerAt time.Time, title string, isTodo bool, age time.Duration, note string) {
 	prefix := ""
 	if isTodo {
 		prefix = "[todo] "
 	}
-	fmt.Fprintf(w, "  %s  %s%s (%s ago)\n",
+	fmt.Fprintf(w, "  %s  %s%s (%s ago)%s\n",
 		triggerAt.Local().Format("2006-01-02 15:04"),
 		prefix,
 		safeText(title),
 		age.Round(time.Minute),
+		note,
 	)
+}
+
+// missedDeliveryNote renders the dispatch-state suffix for an entry of
+// "alarm missed". An unclaimed trigger gets no suffix.
+func missedDeliveryNote(delivery string) string {
+	switch delivery {
+	case "retry":
+		return " (delivery failed; retry exhausted)"
+	case "dispatching":
+		return " (dispatch stalled)"
+	default:
+		return ""
+	}
 }
 
 func writeSyncStatusLine(w io.Writer, status syncPkg.SyncStatus) {

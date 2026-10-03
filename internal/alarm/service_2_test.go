@@ -345,7 +345,15 @@ func TestCheckMissed_SkipsAcknowledged(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, d := range due {
-		svc.MarkFired(ctx, d) //nolint:errcheck // fire-and-forget in bulk setup
+		// A delivered reminder must not appear as missed. Under the
+		// dispatch lifecycle the claim alone is not delivery. Complete it.
+		stateID, err := svc.MarkFired(ctx, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.CompleteAlarmDelivery(ctx, stateID, time.Now()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	missed, _, err := svc.CheckMissed(ctx, time.Now(), 7*24*time.Hour)

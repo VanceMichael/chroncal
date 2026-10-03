@@ -6,10 +6,18 @@ SELECT * FROM alarm_state WHERE alarm_id = ? AND trigger_at = ?;
 -- a sync-only action between the check and the claim cannot leave a fired
 -- state for an alarm the user disabled (issue #579). Zero rows means the
 -- claim failed, and the caller reports sql.ErrNoRows.
+-- The row enters in the "dispatching" state. It reaches "delivered" only
+-- through CompleteAlarmDispatch. A failed dispatch moves to "retry", and a
+-- process death leaves a stale "dispatching" row the next checker takes
+-- over via TakeoverAlarmDispatch.
 -- Keep the action list in lockstep with model.FireableAlarmAction.
 -- name: CreateAlarmState :one
-INSERT INTO alarm_state (alarm_id, event_id, trigger_at, fired_at)
-SELECT sqlc.arg(alarm_id), sqlc.arg(event_id), sqlc.arg(trigger_at), sqlc.arg(fired_at)
+INSERT INTO alarm_state (
+    alarm_id, event_id, trigger_at, fired_at,
+    dispatch_status, claimed_at, claim_token, attempts
+)
+SELECT sqlc.arg(alarm_id), sqlc.arg(event_id), sqlc.arg(trigger_at), sqlc.arg(fired_at),
+       'dispatching', sqlc.arg(claimed_at), sqlc.arg(claim_token), 1
 WHERE EXISTS (
     SELECT 1 FROM event_alarms
     WHERE id = sqlc.arg(alarm_id) AND action IN ('AUDIO','DISPLAY','EMAIL')
@@ -49,9 +57,74 @@ WHERE s.fired_at IS NOT NULL
   AND a.action IN ('AUDIO','DISPLAY','EMAIL')
 ORDER BY s.snoozed_to;
 
+-- Re-fire an expired snooze and start a new dispatch cycle. The UPDATE is
+-- gated on snoozed_to IS NOT NULL, so it acts as an atomic claim between
+-- overlapping checkers. The reset fields match a fresh claim: the cycle
+-- starts at attempt 1 in "dispatching", with no retry or delivery record.
 -- name: RefireAlarmState :execrows
-UPDATE alarm_state SET fired_at = ?, snoozed_to = NULL
-WHERE id = ? AND snoozed_to IS NOT NULL;
+UPDATE alarm_state
+SET fired_at = sqlc.arg(fired_at),
+    snoozed_to = NULL,
+    dispatch_status = 'dispatching',
+    claimed_at = sqlc.arg(claimed_at),
+    claim_token = sqlc.arg(claim_token),
+    attempts = 1,
+    retry_at = NULL,
+    last_error = NULL,
+    delivered_at = NULL
+WHERE id = sqlc.arg(id) AND snoozed_to IS NOT NULL;
+
+-- Take over a dispatch that another checker did not finish. The row is
+-- eligible when it waits for a retry that is due, or when its dispatch
+-- lease expired (the owner process died or hung). A live claim that is
+-- inside its lease is not touched. Neither is a snoozed or an acknowledged
+-- row. The predicate on claim_token keeps a caller from taking over its
+-- own claim. RowsAffected == 0 means this caller lost the race or the row
+-- is not due. The caller then dispatches nothing.
+-- name: TakeoverAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'dispatching',
+    claimed_at = sqlc.arg(claimed_at),
+    claim_token = sqlc.arg(claim_token),
+    attempts = attempts + 1,
+    fired_at = sqlc.arg(fired_at),
+    retry_at = NULL
+WHERE id = sqlc.arg(id)
+  AND acked_at IS NULL
+  AND snoozed_to IS NULL
+  AND (claim_token IS NULL OR claim_token <> sqlc.arg(claim_token))
+  AND (
+        (dispatch_status = 'retry' AND retry_at IS NOT NULL AND retry_at <= sqlc.arg(now))
+     OR (dispatch_status = 'dispatching' AND (claimed_at IS NULL OR claimed_at <= sqlc.arg(lease_boundary)))
+  );
+
+-- Finish a dispatch. Only the claim token owner may complete the row, so a
+-- stale process that lost its lease cannot overwrite a newer attempt.
+-- RowsAffected == 0 means the ownership was lost. The notification may
+-- already be sent. The caller must not write the row again.
+-- name: CompleteAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'delivered',
+    claim_token = NULL,
+    delivered_at = sqlc.arg(delivered_at),
+    retry_at = NULL,
+    last_error = NULL
+WHERE id = sqlc.arg(id)
+  AND claim_token = sqlc.arg(claim_token)
+  AND dispatch_status = 'dispatching';
+
+-- Release a failed dispatch for a later retry. The same token gate as
+-- CompleteAlarmDispatch applies. retry_at carries the deterministic
+-- backoff; last_error records the cause for "alarm list".
+-- name: RetryAlarmDispatch :execrows
+UPDATE alarm_state
+SET dispatch_status = 'retry',
+    claim_token = NULL,
+    retry_at = sqlc.arg(retry_at),
+    last_error = sqlc.arg(last_error)
+WHERE id = sqlc.arg(id)
+  AND claim_token = sqlc.arg(claim_token)
+  AND dispatch_status = 'dispatching';
 
 -- name: ListAlarmStatesByEventID :many
 SELECT * FROM alarm_state WHERE event_id = ? ORDER BY trigger_at;

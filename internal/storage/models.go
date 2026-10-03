@@ -16,13 +16,20 @@ type Account struct {
 }
 
 type AlarmState struct {
-	ID        int64
-	AlarmID   int64
-	EventID   int64
-	TriggerAt string
-	FiredAt   *string
-	AckedAt   *string
-	SnoozedTo *string
+	ID             int64
+	AlarmID        int64
+	EventID        int64
+	TriggerAt      string
+	FiredAt        *string
+	AckedAt        *string
+	SnoozedTo      *string
+	DispatchStatus string
+	ClaimedAt      *string
+	ClaimToken     *string
+	Attempts       int64
+	RetryAt        *string
+	LastError      *string
+	DeliveredAt    *string
 }
 
 type Calendar struct {
@@ -383,13 +390,20 @@ type TodoAlarmAttendee struct {
 }
 
 type TodoAlarmState struct {
-	ID        int64
-	AlarmID   int64
-	TodoID    int64
-	TriggerAt string
-	FiredAt   *string
-	AckedAt   *string
-	SnoozedTo *string
+	ID             int64
+	AlarmID        int64
+	TodoID         int64
+	TriggerAt      string
+	FiredAt        *string
+	AckedAt        *string
+	SnoozedTo      *string
+	DispatchStatus string
+	ClaimedAt      *string
+	ClaimToken     *string
+	Attempts       int64
+	RetryAt        *string
+	LastError      *string
+	DeliveredAt    *string
 }
 
 type TodoAttachment struct {

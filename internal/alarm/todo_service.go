@@ -21,7 +21,12 @@ type TodoDueAlarm struct {
 	Todo      todo.Todo
 	Alarm     model.Alarm
 	TriggerAt time.Time
-	StateID   int64
+	StateID   int64 // non-zero for re-fired snoozed or recovered dispatches
+	// Attempts is the dispatch attempt number this claim runs. See
+	// DueAlarm.Attempts.
+	Attempts int
+	// Claim selects the atomic claim statement. See DueAlarm.Claim.
+	Claim ClaimKind
 }
 
 // TodoAlarmLister defines the interface for a list of todo alarms. The
@@ -42,11 +47,15 @@ type TodoService struct {
 	db    *sql.DB
 	q     *storage.Queries
 	todos TodoAlarmLister
+	// claimToken identifies the owning process in dispatch UPDATEs. A
+	// standalone service gets its own token. The parent Service shares its
+	// token so event and todo dispatches have one owner identity.
+	claimToken string
 }
 
 // NewTodoService creates a new TodoService
 func NewTodoService(db *sql.DB, q *storage.Queries, todos TodoAlarmLister) *TodoService {
-	return &TodoService{db: db, q: q, todos: todos}
+	return &TodoService{db: db, q: q, todos: todos, claimToken: newClaimToken()}
 }
 
 // CheckTodos finds due alarms for todos within the stale threshold window.
@@ -61,6 +70,8 @@ func (s *TodoService) CheckTodos(ctx context.Context, now time.Time) ([]TodoDueA
 	forward := baseForwardWindow + maxLeadTime(triggers)
 	windowStart := now.Add(-StaleThreshold - 24*time.Hour)
 	windowEnd := now.Add(forward)
+	nowStr := now.UTC().Format(time.RFC3339)
+	leaseBoundaryStr := now.Add(-DispatchLease).UTC().Format(time.RFC3339)
 
 	rows, err := s.q.ListAllTodos(ctx)
 	if err != nil {
@@ -159,12 +170,28 @@ func (s *TodoService) CheckTodos(ctx context.Context, now time.Time) ([]TodoDueA
 					}
 
 					triggerKey := tt.UTC().Format(time.RFC3339)
-					_, err = s.q.GetTodoAlarmState(ctx, storage.GetTodoAlarmStateParams{
+					st, err := s.q.GetTodoAlarmState(ctx, storage.GetTodoAlarmStateParams{
 						AlarmID:   a.ID,
 						TriggerAt: triggerKey,
 					})
 					if err == nil {
-						continue // already fired/acknowledged
+						// Delivered or acknowledged: complete. Retry-due or
+						// orphaned: due again. A live dispatch inside its
+						// lease is owned by another checker. A snoozed row
+						// is owned by the snooze path.
+						if !recoverableDispatch(st.DispatchStatus, st.AckedAt != nil, st.SnoozedTo != nil,
+							st.ClaimedAt, st.RetryAt, nowStr, leaseBoundaryStr) {
+							continue
+						}
+						due = append(due, TodoDueAlarm{
+							Todo:      instanceTodo,
+							Alarm:     a,
+							TriggerAt: tt,
+							StateID:   st.ID,
+							Attempts:  int(st.Attempts) + 1,
+							Claim:     ClaimRecover,
+						})
+						continue
 					}
 					if !errors.Is(err, sql.ErrNoRows) {
 						// Transient DB error (e.g. SQLITE_BUSY): we can't
@@ -329,19 +356,22 @@ func computeTodoTriggerTimeForInstance(inst recurrence.ExpandedTodo, alarm model
 	return model.ParseAbsoluteTime(alarm.TriggerValue, inst.Timezone)
 }
 
-// MarkTodoAlarmFired records that a todo alarm has fired. It returns
-// ErrNotFireable when the stored action is sync-only. The insert reads the
-// action in the same statement, so a sync pull that disables the alarm
-// after the check loop reads it cannot leave a fired state behind.
+// MarkTodoAlarmFired claims a fresh todo trigger. The row enters the
+// dispatching state. It returns ErrNotFireable when the stored action is
+// sync-only. The insert reads the action in the same statement, so a sync
+// pull that disables the alarm after the check loop reads it cannot leave
+// a claimed state behind.
 func (s *TodoService) MarkTodoAlarmFired(ctx context.Context, alarmID, todoID int64, triggerAt time.Time) (int64, error) {
 	triggerKey := triggerAt.UTC().Format(time.RFC3339)
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	state, err := s.q.InsertTodoAlarmState(ctx, storage.InsertTodoAlarmStateParams{
-		AlarmID:   alarmID,
-		TodoID:    todoID,
-		TriggerAt: triggerKey,
-		FiredAt:   &now,
+		AlarmID:    alarmID,
+		TodoID:     todoID,
+		TriggerAt:  triggerKey,
+		FiredAt:    &now,
+		ClaimedAt:  &now,
+		ClaimToken: &s.claimToken,
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, ErrNotFireable
@@ -351,6 +381,77 @@ func (s *TodoService) MarkTodoAlarmFired(ctx context.Context, alarmID, todoID in
 	}
 
 	return state.ID, nil
+}
+
+// MarkTodoAlarmRefired claims an expired-snoozed todo refire. It clears
+// the snooze and starts a fresh dispatch cycle. claimed is false when
+// another checker won the gated UPDATE.
+func (s *TodoService) MarkTodoAlarmRefired(ctx context.Context, stateID int64) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	rows, err := s.q.RefireTodoAlarmState(ctx, storage.RefireTodoAlarmStateParams{
+		FiredAt:    &now,
+		ClaimedAt:  &now,
+		ClaimToken: &s.claimToken,
+		ID:         stateID,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// RecoverTodoAlarmDispatch atomically takes over a retry-due todo row or a
+// todo dispatch whose lease expired. claimed is false when another checker
+// won or the row is not recoverable yet.
+func (s *TodoService) RecoverTodoAlarmDispatch(ctx context.Context, stateID int64, now time.Time) (bool, error) {
+	nowStr := now.UTC().Format(time.RFC3339)
+	boundaryStr := now.Add(-DispatchLease).UTC().Format(time.RFC3339)
+	rows, err := s.q.TakeoverTodoAlarmDispatch(ctx, storage.TakeoverTodoAlarmDispatchParams{
+		ID:            stateID,
+		ClaimedAt:     &nowStr,
+		ClaimToken:    &s.claimToken,
+		FiredAt:       &nowStr,
+		Now:           &nowStr,
+		LeaseBoundary: &boundaryStr,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// CompleteTodoDelivery marks a claimed todo dispatch delivered. Only this
+// instance token may complete the row.
+func (s *TodoService) CompleteTodoDelivery(ctx context.Context, stateID int64, now time.Time) (bool, error) {
+	nowStr := now.UTC().Format(time.RFC3339)
+	rows, err := s.q.CompleteTodoAlarmDispatch(ctx, storage.CompleteTodoAlarmDispatchParams{
+		ID:          stateID,
+		ClaimToken:  &s.claimToken,
+		DeliveredAt: &nowStr,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// ScheduleTodoRetry releases a failed todo dispatch to the retry state. It
+// returns the next due time. claimed is false when this instance no longer
+// owns the row.
+func (s *TodoService) ScheduleTodoRetry(ctx context.Context, stateID int64, attempts int, cause error, now time.Time) (time.Time, bool, error) {
+	retryAt := now.Add(RetryDelay(attempts))
+	retryStr := retryAt.UTC().Format(time.RFC3339)
+	errText := dispatchErrorText(cause)
+	rows, err := s.q.RetryTodoAlarmDispatch(ctx, storage.RetryTodoAlarmDispatchParams{
+		ID:         stateID,
+		ClaimToken: &s.claimToken,
+		RetryAt:    &retryStr,
+		LastError:  &errText,
+	})
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return retryAt, rows > 0, nil
 }
 
 // DismissTodoAlarm acknowledges a fired todo alarm
@@ -414,6 +515,7 @@ func (s *TodoService) ListExpiredTodoSnoozed(ctx context.Context, now time.Time)
 			Alarm:     matched,
 			TriggerAt: triggerAt,
 			StateID:   st.ID,
+			Claim:     ClaimRefire,
 		})
 	}
 
