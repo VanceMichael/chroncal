@@ -11,6 +11,7 @@ import (
 	hydratepkg "github.com/douglasdemoura/chroncal/internal/hydrate"
 	icalPkg "github.com/douglasdemoura/chroncal/internal/ical"
 	"github.com/douglasdemoura/chroncal/internal/journal"
+	"github.com/douglasdemoura/chroncal/internal/storage"
 	"github.com/douglasdemoura/chroncal/internal/todo"
 )
 
@@ -34,15 +35,18 @@ var errUnknownOwnerType = errors.New("unknown owner type")
 // entry rather than synchronized edits to parallel switches. A missed
 // type cannot compile cleanly into a silent mis-dispatch.
 type ownerOps struct {
-	softDeleteByUID func(ctx context.Context, e *Engine, uid string) error
-	lookupID        func(ctx context.Context, e *Engine, uid string) (int64, error)
-	export          func(ctx context.Context, e *Engine, uid string) ([]byte, error)
+	softDeleteForCalendar func(ctx context.Context, e *Engine, calendarID int64, uid string) error
+	lookupID              func(ctx context.Context, e *Engine, uid string) (int64, error)
+	export                func(ctx context.Context, e *Engine, uid string) ([]byte, error)
 }
 
 var ownerOpsByType = map[string]ownerOps{
 	ownerTypeEvent: {
-		softDeleteByUID: func(ctx context.Context, e *Engine, uid string) error {
-			return e.q.SoftDeleteEventsByUID(ctx, uid)
+		softDeleteForCalendar: func(ctx context.Context, e *Engine, calendarID int64, uid string) error {
+			return e.q.SoftDeleteEventsByCalendarAndUID(ctx, storage.SoftDeleteEventsByCalendarAndUIDParams{
+				CalendarID: calendarID,
+				Uid:        uid,
+			})
 		},
 		lookupID: func(ctx context.Context, e *Engine, uid string) (int64, error) {
 			row, err := e.q.GetEventByUID(ctx, uid)
@@ -58,8 +62,11 @@ var ownerOpsByType = map[string]ownerOps{
 		},
 	},
 	ownerTypeTodo: {
-		softDeleteByUID: func(ctx context.Context, e *Engine, uid string) error {
-			return e.q.SoftDeleteTodosByUID(ctx, uid)
+		softDeleteForCalendar: func(ctx context.Context, e *Engine, calendarID int64, uid string) error {
+			return e.q.SoftDeleteTodosByCalendarAndUID(ctx, storage.SoftDeleteTodosByCalendarAndUIDParams{
+				CalendarID: calendarID,
+				Uid:        uid,
+			})
 		},
 		lookupID: func(ctx context.Context, e *Engine, uid string) (int64, error) {
 			row, err := e.q.GetTodoByUID(ctx, uid)
@@ -75,8 +82,11 @@ var ownerOpsByType = map[string]ownerOps{
 		},
 	},
 	ownerTypeJournal: {
-		softDeleteByUID: func(ctx context.Context, e *Engine, uid string) error {
-			return e.q.SoftDeleteJournalsByUID(ctx, uid)
+		softDeleteForCalendar: func(ctx context.Context, e *Engine, calendarID int64, uid string) error {
+			return e.q.SoftDeleteJournalsByCalendarAndUID(ctx, storage.SoftDeleteJournalsByCalendarAndUIDParams{
+				CalendarID: calendarID,
+				Uid:        uid,
+			})
 		},
 		lookupID: func(ctx context.Context, e *Engine, uid string) (int64, error) {
 			row, err := e.q.GetJournalByUID(ctx, uid)
@@ -187,16 +197,19 @@ func ownerOpsFor(ownerType string) (ownerOps, error) {
 	return ops, nil
 }
 
-func (e *Engine) deleteLocalResourceByUID(ctx context.Context, ownerType, uid string) error {
-	// Soft-delete across every owner type so a remote DELETE that races with
-	// a user action doesn't nuke the local row — it stays in trash until the
-	// retention window expires. The caller clears the sync_resource so a
-	// later restore re-CREATEs a fresh one via MarkResourceDirty.
+func (e *Engine) deleteLocalResourceForCalendar(ctx context.Context, ownerType string, calendarID int64, uid string) error {
+	// Soft-delete only the rows on the calendar that lost the resource. The
+	// same UID can live on another calendar: an issue #756 invite copy, or a
+	// resource the user moved cross-calendar whose source DELETE is still
+	// pending. A global UID delete would destroy those rows too. The row
+	// stays in trash until the retention window expires. The caller clears
+	// the sync_resource so a later restore re-CREATEs a fresh one via
+	// MarkResourceDirty.
 	ops, err := ownerOpsFor(ownerType)
 	if err != nil {
 		return err
 	}
-	return ops.softDeleteByUID(ctx, e, uid)
+	return ops.softDeleteForCalendar(ctx, e, calendarID, uid)
 }
 
 // lookupOwnerID resolves the local row ID that backs a UID for the given owner

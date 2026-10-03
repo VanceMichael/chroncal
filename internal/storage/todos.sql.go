@@ -916,6 +916,33 @@ func (q *Queries) MarkTodoIdentitiesDirtyForMigration(ctx context.Context, arg M
 	return err
 }
 
+const moveTodosToCalendar = `-- name: MoveTodosToCalendar :execrows
+UPDATE todos SET
+    calendar_id = ?1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE uid = ?2 AND calendar_id = ?3
+`
+
+type MoveTodosToCalendarParams struct {
+	DestinationCalendarID int64
+	Uid                   string
+	SourceCalendarID      int64
+}
+
+// Move every todo row of one UID (master and overrides, live and
+// soft-deleted) from one calendar to another. A cross-calendar move must
+// move the master and its overrides together: CalDAV tracks one resource
+// per UID, and expansion keys overrides on (calendar_id, uid).
+// Soft-deleted rows move too, so trash and purge keep working. Child
+// collections key on the row id. They follow without a rewrite.
+func (q *Queries) MoveTodosToCalendar(ctx context.Context, arg MoveTodosToCalendarParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, moveTodosToCalendar, arg.DestinationCalendarID, arg.Uid, arg.SourceCalendarID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const purgeSoftDeletedTodos = `-- name: PurgeSoftDeletedTodos :execrows
 DELETE FROM todos WHERE deleted_at IS NOT NULL AND deleted_at < ?
 `
@@ -1000,6 +1027,27 @@ WHERE id = ? AND deleted_at IS NULL
 
 func (q *Queries) SoftDeleteTodo(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, softDeleteTodo, id)
+	return err
+}
+
+const softDeleteTodosByCalendarAndUID = `-- name: SoftDeleteTodosByCalendarAndUID :exec
+UPDATE todos SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE calendar_id = ? AND uid = ? AND deleted_at IS NULL
+`
+
+type SoftDeleteTodosByCalendarAndUIDParams struct {
+	CalendarID int64
+	Uid        string
+}
+
+// Calendar-scoped counterpart of SoftDeleteTodosByUID. Pull-driven
+// deletions use this form so a server-reported deletion on one calendar
+// cannot soft-delete rows with the same UID on another calendar. Those
+// rows are an issue #756 copy or a resource moved cross-calendar.
+func (q *Queries) SoftDeleteTodosByCalendarAndUID(ctx context.Context, arg SoftDeleteTodosByCalendarAndUIDParams) error {
+	_, err := q.db.ExecContext(ctx, softDeleteTodosByCalendarAndUID, arg.CalendarID, arg.Uid)
 	return err
 }
 

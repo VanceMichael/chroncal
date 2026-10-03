@@ -803,6 +803,33 @@ func (q *Queries) MarkEventIdentitiesDirtyForMigration(ctx context.Context, arg 
 	return err
 }
 
+const moveEventsToCalendar = `-- name: MoveEventsToCalendar :execrows
+UPDATE events SET
+    calendar_id = ?1,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE uid = ?2 AND calendar_id = ?3
+`
+
+type MoveEventsToCalendarParams struct {
+	DestinationCalendarID int64
+	Uid                   string
+	SourceCalendarID      int64
+}
+
+// Move every event row of one UID (master and overrides, live and
+// soft-deleted) from one calendar to another. A cross-calendar move must
+// move the master and its overrides together: CalDAV tracks one resource
+// per UID, and expansion keys overrides on (calendar_id, uid).
+// Soft-deleted rows move too, so trash and purge keep working. Child
+// collections key on the row id. They follow without a rewrite.
+func (q *Queries) MoveEventsToCalendar(ctx context.Context, arg MoveEventsToCalendarParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, moveEventsToCalendar, arg.DestinationCalendarID, arg.Uid, arg.SourceCalendarID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const purgeEventByID = `-- name: PurgeEventByID :execrows
 DELETE FROM events WHERE id = ? AND deleted_at IS NOT NULL
 `
@@ -926,6 +953,27 @@ WHERE id = ? AND deleted_at IS NULL
 
 func (q *Queries) SoftDeleteEvent(ctx context.Context, id int64) error {
 	_, err := q.db.ExecContext(ctx, softDeleteEvent, id)
+	return err
+}
+
+const softDeleteEventsByCalendarAndUID = `-- name: SoftDeleteEventsByCalendarAndUID :exec
+UPDATE events SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE calendar_id = ? AND uid = ? AND deleted_at IS NULL
+`
+
+type SoftDeleteEventsByCalendarAndUIDParams struct {
+	CalendarID int64
+	Uid        string
+}
+
+// Calendar-scoped counterpart of SoftDeleteEventsByUID. Pull-driven
+// deletions use this form so a server-reported deletion on one calendar
+// cannot soft-delete rows with the same UID on another calendar. Those
+// rows are an issue #756 copy or a resource moved cross-calendar.
+func (q *Queries) SoftDeleteEventsByCalendarAndUID(ctx context.Context, arg SoftDeleteEventsByCalendarAndUIDParams) error {
+	_, err := q.db.ExecContext(ctx, softDeleteEventsByCalendarAndUID, arg.CalendarID, arg.Uid)
 	return err
 }
 
@@ -1150,11 +1198,12 @@ type UpsertEventByUIDParams struct {
 	ConferenceUri  string
 }
 
-// NOTE: ON CONFLICT UPDATE clears deleted_at. This query resurrects
-// soft-deleted rows. Callers outside the pull path in the sync engine
-// must know this. The pull path is safe. The engine excludes
-// tombstoned UIDs before this query runs (engine.go loads tombstones
-// first and skips them during pull).
+// NOTE: ON CONFLICT matches (calendar_id, uid, recurrence_id). The same
+// UID on a second calendar inserts a new row (issue #756). ON CONFLICT
+// UPDATE clears deleted_at. This query resurrects soft-deleted rows.
+// Callers outside the pull path in the sync engine must know this. The
+// pull path is safe. The engine excludes tombstoned UIDs before this
+// query runs (engine.go loads tombstones first and skips them during pull).
 func (q *Queries) UpsertEventByUID(ctx context.Context, arg UpsertEventByUIDParams) (Event, error) {
 	row := q.db.QueryRowContext(ctx, upsertEventByUID,
 		arg.Uid,

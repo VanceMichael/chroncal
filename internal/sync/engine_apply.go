@@ -186,7 +186,7 @@ func (e *Engine) applySyncCollection(ctx context.Context, client *caldav.Client,
 		if !exists || seenUIDs[local.Uid] {
 			continue
 		}
-		deletions.markExplicit(local)
+		deletions.markExplicit(local, tombstonedUIDs)
 	}
 
 	// Absence-inferred deletions: an initial snapshot lists only additions,
@@ -199,10 +199,10 @@ func (e *Engine) applySyncCollection(ctx context.Context, client *caldav.Client,
 	// fetched.
 	if initialSnapshot {
 		deletions.inferFromAbsence(calendarID, localResources, seenUIDs,
-			view.inventoryObserved(), view.absenceWithholdReason())
+			view.inventoryObserved(), view.absenceWithholdReason(), tombstonedUIDs)
 	}
 
-	deleted, deleteFailures := deletions.apply(ctx, e, calendarID)
+	deleted, deleteFailures := deletions.apply(ctx, e)
 	result.deleted += deleted
 
 	if syncResult.SyncToken != "" && view.localRowsSafe() && deleteFailures == 0 {

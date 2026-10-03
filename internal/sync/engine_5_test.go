@@ -43,7 +43,7 @@ func TestSummarizeSyncError(t *testing.T) {
 // tests of the deletion chokepoint.
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func uidSet(rs map[string]string) map[string]bool {
+func uidSet(rs map[string]pendingDeletion) map[string]bool {
 	out := make(map[string]bool, len(rs))
 	for uid := range rs {
 		out[uid] = true
@@ -65,16 +65,16 @@ func TestPendingDeletions_AbsenceGate(t *testing.T) {
 
 	t.Run("incomplete inventory withholds all", func(t *testing.T) {
 		p := newPendingDeletions(discardLogger())
-		p.inferFromAbsence(1, locals, seen, false, "truncated")
-		if got := uidSet(p.owner); len(got) != 0 {
+		p.inferFromAbsence(1, locals, seen, false, "truncated", nil)
+		if got := uidSet(p.items); len(got) != 0 {
 			t.Errorf("incomplete inventory must withhold; got %v", got)
 		}
 	})
 
 	t.Run("complete inventory deletes only the absent, pushed row", func(t *testing.T) {
 		p := newPendingDeletions(discardLogger())
-		p.inferFromAbsence(1, locals, seen, true, "complete")
-		got := uidSet(p.owner)
+		p.inferFromAbsence(1, locals, seen, true, "complete", nil)
+		got := uidSet(p.items)
 		if !got["b"] {
 			t.Error("absent pushed row b should be marked for deletion")
 		}
@@ -92,12 +92,12 @@ func TestPendingDeletions_AbsenceGate(t *testing.T) {
 func TestPendingDeletions_ExplicitAlwaysDeletes(t *testing.T) {
 	t.Parallel()
 	p := newPendingDeletions(discardLogger())
-	p.markExplicit(storage.SyncResource{Uid: "gone", OwnerType: "event"})
-	p.markExplicit(storage.SyncResource{Uid: "", OwnerType: "event"}) // empty UID ignored
+	p.markExplicit(storage.SyncResource{Uid: "gone", OwnerType: "event"}, nil)
+	p.markExplicit(storage.SyncResource{Uid: "", OwnerType: "event"}, nil) // empty UID ignored
 	// An incomplete inventory must not erase an explicit deletion.
 	p.inferFromAbsence(1, []storage.SyncResource{{Uid: "x", OwnerType: "event", RemoteUrl: "/x.ics"}},
-		map[string]bool{}, false, "truncated")
-	got := uidSet(p.owner)
+		map[string]bool{}, false, "truncated", nil)
+	got := uidSet(p.items)
 	if !got["gone"] {
 		t.Error("explicit deletion should always be marked")
 	}
@@ -115,11 +115,11 @@ func TestPendingDeletions_ExplicitAlwaysDeletes(t *testing.T) {
 func TestPendingDeletions_DedupExplicitAndAbsence(t *testing.T) {
 	t.Parallel()
 	p := newPendingDeletions(discardLogger())
-	p.markExplicit(storage.SyncResource{Uid: "dup", OwnerType: "event"})
+	p.markExplicit(storage.SyncResource{Uid: "dup", OwnerType: "event"}, nil)
 	p.inferFromAbsence(1,
 		[]storage.SyncResource{{Uid: "dup", OwnerType: "event", RemoteUrl: "/dup.ics"}},
-		map[string]bool{}, true, "complete")
-	if got := uidSet(p.owner); len(got) != 1 || !got["dup"] {
+		map[string]bool{}, true, "complete", nil)
+	if got := uidSet(p.items); len(got) != 1 || !got["dup"] {
 		t.Errorf("dup should be present exactly once, got %v", got)
 	}
 }
@@ -712,8 +712,8 @@ func TestOwnerDispatchRejectsUnknownTypeUniformly(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 	ctx := context.Background()
 
-	if err := engine.deleteLocalResourceByUID(ctx, "bogus", "uid"); !errors.Is(err, errUnknownOwnerType) {
-		t.Fatalf("deleteLocalResourceByUID err = %v, want errUnknownOwnerType", err)
+	if err := engine.deleteLocalResourceForCalendar(ctx, "bogus", 1, "uid"); !errors.Is(err, errUnknownOwnerType) {
+		t.Fatalf("deleteLocalResourceForCalendar err = %v, want errUnknownOwnerType", err)
 	}
 	if _, err := engine.lookupOwnerID(ctx, "bogus", "uid"); !errors.Is(err, errUnknownOwnerType) {
 		t.Fatalf("lookupOwnerID err = %v, want errUnknownOwnerType", err)

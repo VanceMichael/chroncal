@@ -205,10 +205,11 @@ func (e *Engine) pullFullSnapshot(ctx context.Context, client *caldav.Client, ca
 	// partial-fetch optimization here cannot silently start deleting against
 	// a partial view without flipping the complete flag.
 	deletions := newPendingDeletions(e.logger)
-	deletions.inferFromAbsence(calendarID, localResources, remoteUIDs, true, "complete (QueryAll)")
+	deletions.inferFromAbsence(calendarID, localResources, remoteUIDs, true,
+		"complete (QueryAll)", tombstonedUIDs)
 	// The full-snapshot path stores no sync-token, so a failed deletion here is
 	// self-healing: the next snapshot re-infers the absence and retries.
-	deleted, _ := deletions.apply(ctx, e, calendarID)
+	deleted, _ := deletions.apply(ctx, e)
 	result.deleted += deleted
 
 	return result, nil
@@ -242,22 +243,36 @@ const multigetBatchSize = 50
 // row granularity inside a resource (pruneStaleOverrides). This type cannot
 // host that prune. It still obeys the same completeness rule. See its
 // comment for the gates.
+type pendingDeletion struct {
+	ownerType  string
+	calendarID int64
+}
+
 type pendingDeletions struct {
 	logger *slog.Logger
-	owner  map[string]string // uid -> ownerType, deduped across both sources
+	// items maps UID to the deletion record, deduped across both deletion
+	// sources. Each record carries its own calendar: a UID can exist on
+	// several calendars (issue #756 copies, or a resource moved
+	// cross-calendar), and a deletion on one calendar must never touch the
+	// other calendar's rows.
+	items map[string]pendingDeletion
 }
 
 func newPendingDeletions(logger *slog.Logger) *pendingDeletions {
-	return &pendingDeletions{logger: logger, owner: make(map[string]string)}
+	return &pendingDeletions{logger: logger, items: make(map[string]pendingDeletion)}
 }
 
 // markExplicit records a deletion backed by positive evidence: the server
 // returned 404 for this resource's specific href. Sound regardless of
-// inventory completeness.
-func (p *pendingDeletions) markExplicit(r storage.SyncResource) {
-	if r.Uid != "" {
-		p.owner[r.Uid] = r.OwnerType
+// inventory completeness. A tombstoned UID is excluded. Its source DELETE
+// intent belongs to processTombstones, which keeps the conditional ETag and
+// the 412 conflict protection. This gate must not delete its sync_resource
+// early and turn that DELETE unconditional.
+func (p *pendingDeletions) markExplicit(r storage.SyncResource, tombstoned map[string]bool) {
+	if r.Uid == "" || tombstoned[r.Uid] {
+		return
 	}
+	p.items[r.Uid] = pendingDeletion{ownerType: r.OwnerType, calendarID: r.CalendarID}
 }
 
 // inferFromAbsence records a deletion for every local resource the remote
@@ -269,14 +284,20 @@ func (p *pendingDeletions) markExplicit(r storage.SyncResource) {
 // was not truncated, every listed href that has a local row was fetched,
 // and every fetched body persisted. An unknown multiget miss has no local
 // row. It does not flip complete. Local rows with no remote_url
-// are skipped. They were never pushed.
-func (p *pendingDeletions) inferFromAbsence(calendarID int64, locals []storage.SyncResource, seen map[string]bool, complete bool, reason string) {
+// are skipped. They were never pushed. Tombstoned rows are skipped too:
+// the server may still list the resource until processTombstones DELETEs it,
+// and a resource moved cross-calendar still has a live local row on its
+// destination calendar that this gate must not soft-delete.
+func (p *pendingDeletions) inferFromAbsence(calendarID int64, locals []storage.SyncResource, seen map[string]bool, complete bool, reason string, tombstoned map[string]bool) {
 	var candidates []storage.SyncResource
 	for _, local := range locals {
 		if local.RemoteUrl == "" {
 			continue
 		}
-		if seen[local.Uid] || p.owner[local.Uid] != "" {
+		if seen[local.Uid] || tombstoned[local.Uid] {
+			continue
+		}
+		if _, ok := p.items[local.Uid]; ok {
 			continue
 		}
 		candidates = append(candidates, local)
@@ -290,30 +311,31 @@ func (p *pendingDeletions) inferFromAbsence(calendarID int64, locals []storage.S
 		return
 	}
 	for _, c := range candidates {
-		p.owner[c.Uid] = c.OwnerType
+		p.items[c.Uid] = pendingDeletion{ownerType: c.OwnerType, calendarID: c.CalendarID}
 	}
 }
 
 // apply executes the accumulated deletions. It soft-deletes each local owner
-// row and drops its sync_resource. It returns the count actually deleted and
-// the count that failed. A failed soft-delete (for example a transient
-// SQLITE_BUSY) leaves the local row orphaned. The server dropped it, but we
-// did not. The caller must treat failed > 0 as an incomplete pull and
-// withhold the sync-token. Otherwise the server, now past the old token,
-// never re-reports the deletion. The orphan then survives forever with no
-// retry.
-func (p *pendingDeletions) apply(ctx context.Context, e *Engine, calendarID int64) (deleted, failed int) {
-	for uid, ownerType := range p.owner {
-		if err := e.deleteLocalResourceByUID(ctx, ownerType, uid); err != nil {
-			e.logger.Error("delete local resource", "uid", uid, "owner_type", ownerType, "error", err)
+// row on its own calendar and drops that calendar's sync_resource. It
+// returns the count actually deleted and the count that failed. A failed
+// soft-delete (for example a transient SQLITE_BUSY) leaves the local row
+// orphaned. The server dropped it, but we did not. The caller must treat
+// failed > 0 as an incomplete pull and withhold the sync-token. Otherwise
+// the server, now past the old token, never re-reports the deletion. The
+// orphan then survives forever with no retry.
+func (p *pendingDeletions) apply(ctx context.Context, e *Engine) (deleted, failed int) {
+	for uid, item := range p.items {
+		if err := e.deleteLocalResourceForCalendar(ctx, item.ownerType, item.calendarID, uid); err != nil {
+			e.logger.Error("delete local resource", "calendar_id", item.calendarID,
+				"uid", uid, "owner_type", item.ownerType, "error", err)
 			failed++
 			continue
 		}
 		if err := e.q.DeleteSyncResource(ctx, storage.DeleteSyncResourceParams{
-			CalendarID: calendarID,
+			CalendarID: item.calendarID,
 			Uid:        uid,
 		}); err != nil {
-			e.logger.Error("delete sync resource", "uid", uid, "error", err)
+			e.logger.Error("delete sync resource", "calendar_id", item.calendarID, "uid", uid, "error", err)
 		}
 		deleted++
 	}

@@ -346,11 +346,18 @@ func (s *Service) Update(ctx context.Context, id int64, p UpdateParams) (Journal
 	}
 	p.Status, p.Class = defaults(p.Status, p.Class)
 
-	qtx, commit, rollback, err := s.txscope(ctx)
+	// One transaction wraps the journal row, its categories, and its sync
+	// intent. A cross-calendar move records the source DELETE intent and
+	// the destination push intent in this same transaction. A failed write
+	// rolls the row update back.
+	tx, ownsTx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return Journal{}, err
 	}
-	defer rollback()
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+	qtx := s.q.WithTx(tx)
 
 	r, err := qtx.UpdateJournal(ctx, storage.UpdateJournalParams{
 		ID:             id,
@@ -374,14 +381,48 @@ func (s *Service) Update(ctx context.Context, id int64, p UpdateParams) (Journal
 	if err := replaceCategoriesTx(ctx, qtx, j.ID, timeutil.ParseCategoryList(p.Categories)); err != nil {
 		return Journal{}, fmt.Errorf("replace categories: %w", err)
 	}
-	if err := commit(); err != nil {
-		return Journal{}, fmt.Errorf("commit update journal: %w", err)
+	// A cross-calendar move of a master moves the whole CalDAV resource:
+	// every override row that shares the UID on the source calendar.
+	// CalDAV tracks one resource per UID, and recurrence expansion keys
+	// overrides on (calendar_id, uid). An override-only edit moves just its
+	// own row, so the batch move stays master-scoped.
+	if existing.RecurrenceID == "" && existing.CalendarID != p.CalendarID {
+		if _, err := qtx.MoveJournalsToCalendar(ctx, storage.MoveJournalsToCalendarParams{
+			DestinationCalendarID: p.CalendarID,
+			Uid:                   j.UID,
+			SourceCalendarID:      existing.CalendarID,
+		}); err != nil {
+			return Journal{}, fmt.Errorf("move journal series to calendar: %w", err)
+		}
+	}
+	// Record the sync intent inside the transaction. A same-calendar edit
+	// marks its resource dirty. A cross-calendar move records the source
+	// DELETE intent and the destination push intent. A failed write rolls
+	// the row update back.
+	if err := storage.MoveResourceOwnership(ctx, tx, existing.CalendarID, j.CalendarID, j.UID, "journal"); err != nil {
+		return Journal{}, fmt.Errorf("record sync intent: %w", err)
+	}
+	if ownsTx {
+		if err := tx.Commit(); err != nil {
+			return Journal{}, fmt.Errorf("commit update journal: %w", err)
+		}
 	}
 	j.Categories = p.Categories
-	if err := storage.MarkResourceDirty(ctx, s.dirtyExec(), j.CalendarID, j.UID, "journal"); err != nil {
-		return Journal{}, fmt.Errorf("mark resource dirty: %w", err)
-	}
 	return j, nil
+}
+
+// beginWriteTx returns the transaction a write joins and whether the caller
+// owns it (and must commit it). A service already bound with WithTx joins
+// the outer transaction. Otherwise the call opens a fresh transaction.
+func (s *Service) beginWriteTx(ctx context.Context) (*sql.Tx, bool, error) {
+	if s.tx != nil {
+		return s.tx, false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin tx: %w", err)
+	}
+	return tx, true, nil
 }
 
 func (s *Service) UpsertByUID(ctx context.Context, p UpsertParams) (Journal, error) {

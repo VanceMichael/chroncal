@@ -116,6 +116,28 @@ UPDATE journals SET
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE uid = ? AND deleted_at IS NULL;
 
+-- name: SoftDeleteJournalsByCalendarAndUID :exec
+-- Calendar-scoped counterpart of SoftDeleteJournalsByUID. Pull-driven
+-- deletions use this form so a server-reported deletion on one calendar
+-- cannot soft-delete rows with the same UID on another calendar. Those
+-- rows are an issue #756 copy or a resource moved cross-calendar.
+UPDATE journals SET
+    deleted_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE calendar_id = ? AND uid = ? AND deleted_at IS NULL;
+
+-- name: MoveJournalsToCalendar :execrows
+-- Move every journal row of one UID (master and overrides, live and
+-- soft-deleted) from one calendar to another. A cross-calendar move must
+-- move the master and its overrides together: CalDAV tracks one resource
+-- per UID, and expansion keys overrides on (calendar_id, uid).
+-- Soft-deleted rows move too, so trash and purge keep working. Child
+-- collections key on the row id. They follow without a rewrite.
+UPDATE journals SET
+    calendar_id = sqlc.arg(destination_calendar_id),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE uid = sqlc.arg(uid) AND calendar_id = sqlc.arg(source_calendar_id);
+
 -- name: RestoreJournal :exec
 UPDATE journals SET
     deleted_at = NULL,

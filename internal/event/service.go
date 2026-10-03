@@ -368,15 +368,17 @@ func (s *Service) Update(ctx context.Context, id int64, p UpdateParams) (Event, 
 	defer tx.Rollback()
 	qtx := s.q.WithTx(tx)
 
-	e, err := updateEventTx(ctx, qtx, id, p)
+	e, srcCalendarID, err := updateEventTx(ctx, qtx, id, p)
 	if err != nil {
 		return Event{}, err
 	}
-	// Mark dirty inside the transaction so a failed sync-tracking write rolls
-	// the edit back rather than committing a change that is never pushed
-	// (issue #107).
-	if err := storage.MarkResourceDirty(ctx, tx, e.CalendarID, e.UID, "event"); err != nil {
-		return Event{}, fmt.Errorf("mark resource dirty: %w", err)
+	// Record the sync intent inside the transaction so a failed
+	// sync-tracking write rolls the edit back rather than committing a
+	// change that is never pushed (issue #107). A cross-calendar move
+	// records the source DELETE intent and the destination push intent in
+	// the same transaction as the row move.
+	if err := storage.MoveResourceOwnership(ctx, tx, srcCalendarID, e.CalendarID, e.UID, "event"); err != nil {
+		return Event{}, fmt.Errorf("record sync ownership move: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Event{}, fmt.Errorf("commit update event: %w", err)
@@ -412,18 +414,20 @@ func (s *Service) UpdateWithRelations(ctx context.Context, id int64, p UpdatePar
 	defer tx.Rollback()
 	qtx := s.q.WithTx(tx)
 
-	e, err := updateEventTx(ctx, qtx, id, p)
+	e, srcCalendarID, err := updateEventTx(ctx, qtx, id, p)
 	if err != nil {
 		return Event{}, err
 	}
 	if err := replaceRelationsTx(ctx, qtx, e.ID, attendees, alarms); err != nil {
 		return Event{}, err
 	}
-	// Mark dirty inside the transaction so a failed sync-tracking write rolls
-	// the edit back rather than committing a change that is never pushed
-	// (issue #107).
-	if err := storage.MarkResourceDirty(ctx, tx, e.CalendarID, e.UID, "event"); err != nil {
-		return Event{}, fmt.Errorf("mark resource dirty: %w", err)
+	// Record the sync intent inside the transaction so a failed
+	// sync-tracking write rolls the edit and its relations back rather than
+	// committing a change that is never pushed (issue #107). A
+	// cross-calendar move records the source DELETE intent and the
+	// destination push intent in the same transaction as the row move.
+	if err := storage.MoveResourceOwnership(ctx, tx, srcCalendarID, e.CalendarID, e.UID, "event"); err != nil {
+		return Event{}, fmt.Errorf("record sync ownership move: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Event{}, fmt.Errorf("commit update event: %w", err)
@@ -434,17 +438,20 @@ func (s *Service) UpdateWithRelations(ctx context.Context, id int64, p UpdatePar
 // updateEventTx writes the event row and its categories using a tx-bound
 // Queries. It opens no transaction and does not commit or mark the resource
 // dirty, so callers can compose it with attendee/alarm writes inside one
-// transaction.
-func updateEventTx(ctx context.Context, qtx *storage.Queries, id int64, p UpdateParams) (Event, error) {
+// transaction. It returns the calendar ID the row had before the write, so
+// the caller can record a cross-calendar ownership move together with the
+// row write.
+func updateEventTx(ctx context.Context, qtx *storage.Queries, id int64, p UpdateParams) (Event, int64, error) {
 	// Every update entry point reaches this function, so the span rule
 	// lives here rather than at each caller.
 	if err := validateDurationValue(p.StartTime, p.DurationValue); err != nil {
-		return Event{}, err
+		return Event{}, 0, err
 	}
 	old, err := qtx.GetEvent(ctx, id)
 	if err != nil {
-		return Event{}, err
+		return Event{}, 0, err
 	}
+	srcCalendarID := old.CalendarID
 	r, err := qtx.UpdateEvent(ctx, storage.UpdateEventParams{
 		ID:             id,
 		Title:          p.Title,
@@ -469,19 +476,35 @@ func updateEventTx(ctx context.Context, qtx *storage.Queries, id int64, p Update
 		ConferenceUri:  p.ConferenceURI,
 	})
 	if err != nil {
-		return Event{}, err
+		return Event{}, 0, err
 	}
 	e := FromStorage(r)
 	if err := replaceCategoriesTx(ctx, qtx, e.ID, ParseCategoryList(p.Categories)); err != nil {
-		return Event{}, fmt.Errorf("replace categories: %w", err)
+		return Event{}, 0, fmt.Errorf("replace categories: %w", err)
 	}
 	if localSpanEdit(old, p) {
 		if err := clearPreservedDTENDTx(ctx, qtx, e.ID); err != nil {
-			return Event{}, err
+			return Event{}, 0, err
+		}
+	}
+	// A cross-calendar move of a master moves the whole CalDAV resource:
+	// every override row that shares the UID on the source calendar.
+	// CalDAV tracks one resource per UID, and recurrence expansion keys
+	// overrides on (calendar_id, uid). Overrides left behind would detach
+	// from the moved master and export to the wrong calendar. The master
+	// row above already moved; this moves its siblings. An override-only
+	// edit moves just its own row, so the batch move stays master-scoped.
+	if old.RecurrenceID == "" && srcCalendarID != p.CalendarID {
+		if _, err := qtx.MoveEventsToCalendar(ctx, storage.MoveEventsToCalendarParams{
+			DestinationCalendarID: p.CalendarID,
+			Uid:                   e.UID,
+			SourceCalendarID:      srcCalendarID,
+		}); err != nil {
+			return Event{}, 0, fmt.Errorf("move event series to calendar: %w", err)
 		}
 	}
 	e.Categories = p.Categories
-	return e, nil
+	return e, srcCalendarID, nil
 }
 
 // localSpanEdit reports whether an update replaces the stored end time or

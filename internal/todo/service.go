@@ -501,14 +501,19 @@ func (s *Service) Update(ctx context.Context, id int64, p UpdateParams) (Todo, e
 		return Todo{}, err
 	}
 
-	// One transaction wraps the todo row and its categories. A category write
-	// that fails then rolls the row update back. The path does not commit a
-	// half-updated row whose MarkResourceDirty never ran (issue #222).
-	qtx, commit, rollback, err := s.txscope(ctx)
+	// One transaction wraps the todo row, its categories, and its sync
+	// intent. A write that fails then rolls the row update back. The path
+	// does not commit a half-updated row whose sync intent never ran
+	// (issue #222). A cross-calendar move records the source DELETE intent
+	// and the destination push intent in this same transaction.
+	tx, ownsTx, err := s.beginWriteTx(ctx)
 	if err != nil {
 		return Todo{}, err
 	}
-	defer rollback()
+	if ownsTx {
+		defer func() { _ = tx.Rollback() }()
+	}
+	qtx := s.q.WithTx(tx)
 
 	r, err := qtx.UpdateTodo(ctx, storage.UpdateTodoParams{
 		ID:              id,
@@ -539,12 +544,48 @@ func (s *Service) Update(ctx context.Context, id int64, p UpdateParams) (Todo, e
 	if err := replaceCategoriesTx(ctx, qtx, t.ID, timeutil.ParseCategoryList(p.Categories)); err != nil {
 		return Todo{}, fmt.Errorf("replace categories: %w", err)
 	}
-	if err := commit(); err != nil {
-		return Todo{}, fmt.Errorf("commit update todo: %w", err)
+	// A cross-calendar move of a master moves the whole CalDAV resource:
+	// every override row that shares the UID on the source calendar.
+	// CalDAV tracks one resource per UID, and recurrence expansion keys
+	// overrides on (calendar_id, uid). An override-only edit moves just its
+	// own row, so the batch move stays master-scoped.
+	if existing.RecurrenceID == "" && existing.CalendarID != p.CalendarID {
+		if _, err := qtx.MoveTodosToCalendar(ctx, storage.MoveTodosToCalendarParams{
+			DestinationCalendarID: p.CalendarID,
+			Uid:                   t.UID,
+			SourceCalendarID:      existing.CalendarID,
+		}); err != nil {
+			return Todo{}, fmt.Errorf("move todo series to calendar: %w", err)
+		}
+	}
+	// Record the sync intent inside the transaction. A same-calendar edit
+	// marks its resource dirty. A cross-calendar move records the source
+	// DELETE intent and the destination push intent. A failed write rolls
+	// the row update back.
+	if err := storage.MoveResourceOwnership(ctx, tx, existing.CalendarID, t.CalendarID, t.UID, "todo"); err != nil {
+		return Todo{}, fmt.Errorf("record sync intent: %w", err)
+	}
+	if ownsTx {
+		if err := tx.Commit(); err != nil {
+			return Todo{}, fmt.Errorf("commit update todo: %w", err)
+		}
 	}
 	t.Categories = p.Categories
-	_ = storage.MarkResourceDirty(ctx, s.dirtyExec(), t.CalendarID, t.UID, "todo")
 	return t, nil
+}
+
+// beginWriteTx returns the transaction a write joins and whether the caller
+// owns it (and must commit it). A service already bound with WithTx joins
+// the outer transaction. Otherwise the call opens a fresh transaction.
+func (s *Service) beginWriteTx(ctx context.Context) (*sql.Tx, bool, error) {
+	if s.tx != nil {
+		return s.tx, false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin tx: %w", err)
+	}
+	return tx, true, nil
 }
 
 func (s *Service) Complete(ctx context.Context, id int64) (Todo, error) {
